@@ -7,9 +7,9 @@ from django.db.models import Q, Prefetch
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.exceptions import ValidationError
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet
+from rest_framework.viewsets import ModelViewSet
 
 from apps.accounts import models, serializers
 from apps.core.utils import get_active_scope
@@ -24,38 +24,100 @@ def generate_password(length=12):
     return "".join(secrets.choice(chars) for _ in range(length))
 
 
+# ===================== Helper: Validate Scope Access =====================
+
+def validate_scope_header(request):
+    """
+    Validate X-Scope-ID header for non-superusers.
+    Returns (scope, error_response) tuple.
+    - If valid: (scope, None)
+    - If invalid/missing: (None, PermissionDenied)
+    """
+    from rest_framework.exceptions import PermissionDenied
+
+    user = request.user
+    header_scope_id = request.headers.get("X-Scope-ID")
+
+    # Superuser without header - allowed, returns None scope (means "all")
+    if user.is_superuser and not header_scope_id:
+        return None, None
+
+    # Non-superuser without header - error
+    if not header_scope_id:
+        raise PermissionDenied(
+            "X-Scope-ID header is required. Pass a scope id you have access to."
+        )
+
+    # Validate scope exists
+    try:
+        scope = models.TenantScope.objects.get(id=header_scope_id, is_active=True)
+    except models.TenantScope.DoesNotExist:
+        raise PermissionDenied(
+            f"X-Scope-ID: Scope with id '{header_scope_id}' does not exist or is inactive."
+        )
+
+    # Superuser with header - validate scope exists (already done), return it
+    if user.is_superuser:
+        return scope, None
+
+    # Non-superuser: validate membership
+    if not models.ScopeMembership.objects.filter(
+        user=user,
+        scope=scope,
+        is_active=True,
+    ).exists():
+        raise PermissionDenied(
+            f"X-Scope-ID: You are not a member of scope '{scope.name}' (id={scope.id}). "
+            "Pass a scope id you have access to."
+        )
+
+    return scope, None
+
+
+def get_scopes_in_boundary(scope):
+    """
+    Get all scope IDs within the boundary of the given scope.
+    Includes the scope itself + all child scopes.
+    """
+    if scope is None:
+        return None  # None means all scopes
+
+    scope_ids = {scope.id}
+    child_scopes = scope.get_child_scopes()
+    scope_ids.update(s.id for s in child_scopes)
+    return scope_ids
+
+
 # ===================== Me Endpoint =====================
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def me(request):
     """
-    Get current user info with full membership tree.
-    Returns user details, active scope, and all memberships with permissions.
+    Get current user info with memberships within scope boundary.
+
+    Headers:
+    - X-Scope-ID: Required for non-superusers. Returns memberships within that scope boundary.
+
+    Superuser without X-Scope-ID: Returns all memberships.
+    Regular user without X-Scope-ID: 403 error.
     """
     user = request.user
     profile = getattr(user, "profile", None)
 
-    # Get active scope
-    active_scope_id = None
-    if profile and profile.active_scope_id:
-        active_scope_id = profile.active_scope_id
-    try:
-        scope = get_active_scope(request)
-        if scope:
-            active_scope_id = scope.id
-    except Exception:
-        pass
+    # Validate scope header
+    active_scope, _ = validate_scope_header(request)
 
-    # Get all memberships
+    # Get boundary scope IDs
+    boundary_scope_ids = get_scopes_in_boundary(active_scope)
+
+    # Get memberships (filtered by boundary if applicable)
     memberships = models.ScopeMembership.objects.filter(
         user=user, is_active=True
     ).select_related("scope", "role", "scope__org", "scope__company", "scope__entity", "scope__site")
 
-    # Get all user scopes with permissions
-    user_scopes = models.UserScope.objects.filter(
-        user=user, is_active=True
-    ).select_related("scope", "scope__site")
+    if boundary_scope_ids is not None:
+        memberships = memberships.filter(scope_id__in=boundary_scope_ids)
 
     # Build membership tree
     membership_data = []
@@ -85,22 +147,6 @@ def me(request):
 
         membership_data.append(entry)
 
-    # Build user scope permissions
-    scope_permissions = {}
-    for us in user_scopes:
-        scope_permissions[us.scope_id] = {
-            "user_scope_id": us.id,
-            "can_view": us.can_view,
-            "can_create": us.can_create,
-            "can_edit": us.can_edit,
-            "can_delete": us.can_delete,
-        }
-        if us.scope.site:
-            scope_permissions[us.scope_id]["site"] = {
-                "id": us.scope.site.id,
-                "name": us.scope.site.name,
-            }
-
     data = {
         "user": {
             "id": user.id,
@@ -111,11 +157,232 @@ def me(request):
             "is_superuser": user.is_superuser,
             "role": profile.role if profile else None,
         },
-        "active_scope_id": active_scope_id,
+        "active_scope": {
+            "id": active_scope.id,
+            "name": active_scope.name,
+            "scope_type": active_scope.scope_type,
+        } if active_scope else None,
         "memberships": membership_data,
-        "scope_permissions": scope_permissions,
     }
     return Response(data)
+
+
+# ===================== Available Scopes Endpoint =====================
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def available_scopes(request):
+    """
+    Get scopes the current user can access within the X-Scope-ID boundary.
+
+    Headers:
+    - X-Scope-ID: Required for non-superusers. Returns scopes within that boundary.
+
+    Superuser without X-Scope-ID: Returns all scopes.
+    Regular user without X-Scope-ID: 403 error.
+
+    Response:
+    {
+        "scopes": [
+            {
+                "id": 1,
+                "name": "ABC Group",
+                "scope_type": "ORG",
+                "level": 0,
+                "org": {"id": 1, "name": "ABC Group"},
+                "company": null,
+                "entity": null
+            },
+            ...
+        ],
+        "active_scope": {"id": 1, "name": "ABC Group", "scope_type": "ORG"},
+        "highest_level": "ORG"
+    }
+    """
+    user = request.user
+
+    # Validate scope header
+    active_scope, _ = validate_scope_header(request)
+
+    # Get boundary scope IDs
+    boundary_scope_ids = get_scopes_in_boundary(active_scope)
+
+    # Get scopes within boundary
+    if boundary_scope_ids is None:
+        # Superuser without header - all scopes
+        all_scopes = models.TenantScope.objects.select_related(
+            "org", "company", "company__org", "entity", "entity__company", "entity__company__org", "site"
+        ).filter(is_active=True)
+    else:
+        # Filter to boundary
+        all_scopes = models.TenantScope.objects.select_related(
+            "org", "company", "company__org", "entity", "entity__company", "entity__company__org", "site"
+        ).filter(id__in=boundary_scope_ids, is_active=True)
+
+    if not all_scopes.exists():
+        return Response({"scopes": [], "active_scope": None, "highest_level": None})
+
+    # Determine level order for sorting and display
+    level_order = {
+        models.TenantScope.ScopeType.ORG: 0,
+        models.TenantScope.ScopeType.COMPANY: 1,
+        models.TenantScope.ScopeType.ENTITY: 2,
+        models.TenantScope.ScopeType.SITE: 3,
+    }
+
+    # Build scope list with hierarchy info
+    scope_list = []
+    for scope in all_scopes:
+        entry = {
+            "id": scope.id,
+            "name": scope.name,
+            "code": scope.code,
+            "scope_type": scope.scope_type,
+            "level": level_order.get(scope.scope_type, 99),
+            "org": None,
+            "company": None,
+            "entity": None,
+            "site": None,
+        }
+
+        # Add hierarchy references
+        if scope.scope_type == models.TenantScope.ScopeType.ORG and scope.org:
+            entry["org"] = {"id": scope.org.id, "name": scope.org.name, "code": scope.org.code}
+
+        elif scope.scope_type == models.TenantScope.ScopeType.COMPANY and scope.company:
+            entry["company"] = {"id": scope.company.id, "name": scope.company.name, "code": scope.company.code}
+            entry["org"] = {"id": scope.company.org.id, "name": scope.company.org.name, "code": scope.company.org.code}
+
+        elif scope.scope_type == models.TenantScope.ScopeType.ENTITY and scope.entity:
+            entry["entity"] = {"id": scope.entity.id, "name": scope.entity.name, "code": scope.entity.code}
+            entry["company"] = {
+                "id": scope.entity.company.id,
+                "name": scope.entity.company.name,
+                "code": scope.entity.company.code
+            }
+            entry["org"] = {
+                "id": scope.entity.company.org.id,
+                "name": scope.entity.company.org.name,
+                "code": scope.entity.company.org.code
+            }
+
+        elif scope.scope_type == models.TenantScope.ScopeType.SITE and scope.site:
+            entry["site"] = {"id": scope.site.id, "name": scope.site.name, "code": scope.site.code}
+
+        scope_list.append(entry)
+
+    # Sort by level, then by name
+    scope_list.sort(key=lambda x: (x["level"], x["name"]))
+
+    # Determine highest level
+    highest_level = min(scope_list, key=lambda x: x["level"])["scope_type"] if scope_list else None
+
+    return Response({
+        "scopes": scope_list,
+        "active_scope": {
+            "id": active_scope.id,
+            "name": active_scope.name,
+            "scope_type": active_scope.scope_type,
+        } if active_scope else None,
+        "highest_level": highest_level,
+    })
+
+
+# ===================== Permissions =====================
+
+
+def _user_can_manage_org(user, org):
+    """True if user can manage this org (create companies under it)."""
+    if user.is_superuser:
+        return True
+    org_scope = models.TenantScope.objects.filter(
+        org=org, scope_type=models.TenantScope.ScopeType.ORG, is_active=True
+    ).first()
+    if not org_scope:
+        return False
+    return models.ScopeMembership.objects.filter(
+        user=user, scope=org_scope, is_active=True
+    ).exists()
+
+
+def _user_can_manage_company(user, company):
+    """True if user can manage this company (create entities under it)."""
+    if user.is_superuser:
+        return True
+    org_scope = models.TenantScope.objects.filter(
+        org=company.org, scope_type=models.TenantScope.ScopeType.ORG, is_active=True
+    ).first()
+    company_scope = models.TenantScope.objects.filter(
+        company=company, scope_type=models.TenantScope.ScopeType.COMPANY, is_active=True
+    ).first()
+    scope_ids = [s.id for s in [org_scope, company_scope] if s]
+    if not scope_ids:
+        return False
+    return models.ScopeMembership.objects.filter(
+        user=user, scope_id__in=scope_ids, is_active=True
+    ).exists()
+
+
+class IsSuperuserForOrg(BasePermission):
+    """Org: read = any authenticated; create/update/delete = superuser only."""
+    def has_permission(self, request, view):
+        if not request.user.is_authenticated:
+            return False
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return True
+        return request.user.is_superuser
+
+
+class IsSuperuserOrOrgAdminForCompany(BasePermission):
+    """Company: read = any authenticated; create/update/delete = superuser OR org admin."""
+    def has_permission(self, request, view):
+        if not request.user.is_authenticated:
+            return False
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return True
+        if request.user.is_superuser:
+            return True
+        org_id = None
+        if view.action == "create" and request.data:
+            org_id = request.data.get("org") or request.data.get("org_id")
+        if org_id is not None:
+            try:
+                org = models.Org.objects.get(id=org_id)
+                return _user_can_manage_org(request.user, org)
+            except (models.Org.DoesNotExist, TypeError, ValueError):
+                return False
+        return False
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return True
+        return _user_can_manage_org(request.user, obj.org)
+
+
+class IsSuperuserOrOrgOrCompanyAdminForEntity(BasePermission):
+    """Entity: read = any authenticated; create/update/delete = superuser OR org/company admin."""
+    def has_permission(self, request, view):
+        if not request.user.is_authenticated:
+            return False
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return True
+        if request.user.is_superuser:
+            return True
+        company_id = None
+        if view.action == "create" and request.data:
+            company_id = request.data.get("company") or request.data.get("company_id")
+        if company_id is not None:
+            try:
+                company = models.Company.objects.get(id=company_id)
+                return _user_can_manage_company(request.user, company)
+            except (models.Company.DoesNotExist, TypeError, ValueError):
+                return False
+        return False
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return True
+        return _user_can_manage_company(request.user, obj.company)
 
 
 # ===================== Org / Company / Entity ViewSets =====================
@@ -123,7 +390,7 @@ def me(request):
 class OrgViewSet(ModelViewSet):
     queryset = models.Org.objects.all()
     serializer_class = serializers.OrgSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsSuperuserForOrg]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -136,7 +403,7 @@ class OrgViewSet(ModelViewSet):
 class CompanyViewSet(ModelViewSet):
     queryset = models.Company.objects.all()
     serializer_class = serializers.CompanySerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsSuperuserOrOrgAdminForCompany]
 
     def get_queryset(self):
         qs = super().get_queryset().select_related("org")
@@ -152,7 +419,7 @@ class CompanyViewSet(ModelViewSet):
 class EntityViewSet(ModelViewSet):
     queryset = models.Entity.objects.all()
     serializer_class = serializers.EntitySerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsSuperuserOrOrgOrCompanyAdminForEntity]
 
     def get_queryset(self):
         qs = super().get_queryset().select_related("company", "company__org")
@@ -177,11 +444,10 @@ class TenantScopeViewSet(ModelViewSet):
         qs = super().get_queryset().select_related("org", "company", "entity", "site")
 
         if not user.is_superuser:
-            # Filter to scopes user has access to
-            qs = qs.filter(
-                Q(memberships__user=user, memberships__is_active=True) |
-                Q(user_scopes__user=user, user_scopes__is_active=True)
-            ).distinct()
+            # Show user's scope + all child scopes (org admin sees org+company+entity)
+            allowed_scopes = models.TenantScope.get_available_scopes_for_user(user)
+            allowed_ids = list(allowed_scopes.values_list("id", flat=True))
+            qs = qs.filter(id__in=allowed_ids)
 
         # Filter by scope type
         scope_type = self.request.query_params.get("scope_type")
@@ -207,24 +473,6 @@ class TenantScopeViewSet(ModelViewSet):
 
         return qs
 
-    @action(detail=False, methods=["post"], url_path="set-active")
-    def set_active(self, request):
-        """Set active scope for current user."""
-        scope_id = request.data.get("scope_id")
-
-        if scope_id:
-            try:
-                scope = models.TenantScope.objects.get(id=scope_id)
-            except models.TenantScope.DoesNotExist:
-                raise ValidationError("Invalid scope_id.")
-
-        profile, _ = models.UserProfile.objects.get_or_create(user=request.user)
-        profile.active_scope_id = scope_id
-        profile.save()
-
-        return Response({"active_scope_id": scope_id})
-
-
 # ===================== Permission / Role ViewSets =====================
 
 class PermissionViewSet(ModelViewSet):
@@ -245,11 +493,13 @@ class RoleViewSet(ScopedViewSet):
     def get_queryset(self):
         qs = super().get_queryset().select_related("scope")
 
-        # Allow filtering by scope_id param
+        # When scope_id is provided, return only roles for that scope (no ancestors)
         scope_id = self.request.query_params.get("scope_id")
         if scope_id:
-            return models.Role.objects.filter(scope_id=scope_id)
-
+            try:
+                return models.Role.objects.filter(scope_id=int(scope_id)).order_by("code")
+            except ValueError:
+                pass
         return qs
 
 
@@ -299,77 +549,6 @@ class ScopeMembershipViewSet(ScopedViewSet):
         return qs
 
 
-# ===================== UserScope ViewSet =====================
-
-class UserScopeViewSet(ModelViewSet):
-    """
-    ViewSet for managing user scope permissions.
-
-    Endpoints:
-    - GET /user-scopes/ - List user scopes
-    - POST /user-scopes/ - Create user scope
-    - GET /user-scopes/{id}/ - Get scope details
-    - PATCH /user-scopes/{id}/ - Update permissions
-    - DELETE /user-scopes/{id}/ - Deactivate scope (soft delete)
-    """
-
-    queryset = models.UserScope.objects.all()
-    serializer_class = serializers.UserScopeSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_serializer_class(self):
-        if self.action == "list":
-            return serializers.UserScopeListSerializer
-        if self.action == "create":
-            return serializers.UserScopeCreateSerializer
-        if self.action in ["update", "partial_update"]:
-            return serializers.UserScopeUpdateSerializer
-        return serializers.UserScopeSerializer
-
-    def get_queryset(self):
-        qs = super().get_queryset().select_related("scope", "user")
-
-        # Filter by user
-        user_id = self.request.query_params.get("user")
-        if user_id:
-            qs = qs.filter(user_id=user_id)
-
-        # Filter by scope type
-        scope_type = self.request.query_params.get("scope_type")
-        if scope_type:
-            qs = qs.filter(scope__scope_type=scope_type)
-
-        # Filter by active status
-        is_active = self.request.query_params.get("is_active")
-        if is_active is not None:
-            qs = qs.filter(is_active=is_active in ["1", "true", "True"])
-
-        return qs
-
-    def perform_destroy(self, instance):
-        """Soft delete - set is_active to False."""
-        instance.is_active = False
-        instance.save()
-
-
-# ===================== UserCredential ViewSet =====================
-
-class UserCredentialViewSet(ReadOnlyModelViewSet):
-    queryset = models.UserCredential.objects.select_related("user", "scope")
-    serializer_class = serializers.UserCredentialSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        user = self.request.user
-        if not user.is_superuser:
-            return self.queryset.none()
-        qs = self.queryset
-        scope_id = self.request.query_params.get("scope_id")
-        if scope_id:
-            qs = qs.filter(scope_id=scope_id)
-        return qs.order_by("-id")
-
-
 # ===================== UserProfile ViewSet =====================
 
 class UserProfileViewSet(ModelViewSet):
@@ -378,7 +557,7 @@ class UserProfileViewSet(ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        qs = super().get_queryset().select_related("user", "active_scope")
+        qs = super().get_queryset().select_related("user")
 
         user_id = self.request.query_params.get("user_id")
         if user_id:
@@ -416,15 +595,17 @@ class UserViewSet(ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         qs = super().get_queryset().prefetch_related(
-            "user_scopes", "user_scopes__scope", "profile"
+            "scope_memberships", "scope_memberships__scope", "profile"
         )
 
         if not user.is_superuser:
             scope = get_active_scope(self.request)
             if scope:
+                # Only users with ScopeMembership in active scope or its children (org/company/entity admins)
+                allowed_scope_ids = list(scope.get_child_scopes().values_list("id", flat=True))
                 qs = qs.filter(
-                    Q(scope_memberships__scope=scope) |
-                    Q(user_scopes__scope=scope, user_scopes__is_active=True)
+                    scope_memberships__scope_id__in=allowed_scope_ids,
+                    scope_memberships__is_active=True,
                 ).distinct()
 
         # Search
@@ -437,22 +618,24 @@ class UserViewSet(ModelViewSet):
                 Q(last_name__icontains=search)
             )
 
-        # Filter by scope_type
+        # Optional: filter by scope (narrow within allowed scopes)
         scope_type = self.request.query_params.get("scope_type")
         scope_id = self.request.query_params.get("scope_id")
         if scope_type and scope_id:
             qs = qs.filter(
-                user_scopes__scope__scope_type=scope_type,
-                user_scopes__scope_id=scope_id,
-                user_scopes__is_active=True
+                scope_memberships__scope__scope_type=scope_type,
+                scope_memberships__scope_id=scope_id,
+                scope_memberships__is_active=True,
             ).distinct()
 
-        # Filter by org_id
+        # Optional: filter by org_id (narrow within allowed scopes)
         org_id = self.request.query_params.get("org_id")
         if org_id:
             qs = qs.filter(
                 Q(scope_memberships__scope__org_id=org_id) |
-                Q(user_scopes__scope__org_id=org_id, user_scopes__is_active=True)
+                Q(scope_memberships__scope__company__org_id=org_id) |
+                Q(scope_memberships__scope__entity__company__org_id=org_id),
+                scope_memberships__is_active=True,
             ).distinct()
 
         return qs
@@ -467,11 +650,8 @@ class UserViewSet(ModelViewSet):
         password = data.pop("password", None) or generate_password()
         role = data.pop("role", models.UserProfile.UserRole.MANAGER)
         profile_json = data.pop("profile_json", {})
-        site_id = data.pop("site_id", None)
-        can_view = data.pop("can_view", True)
-        can_create = data.pop("can_create", False)
-        can_edit = data.pop("can_edit", False)
-        can_delete = data.pop("can_delete", False)
+        scope_id = data.pop("scope_id", None)
+        role_id = data.pop("role_id", None)
 
         # Create user
         user = User(**data)
@@ -479,181 +659,52 @@ class UserViewSet(ModelViewSet):
         user.save()
 
         # Create profile
-        models.UserProfile.objects.create(
+        profile = models.UserProfile.objects.create(
             user=user,
             role=role,
             profile_json=profile_json
         )
 
-        # Assign to site if provided
-        user_scope = None
-        if site_id:
-            from apps.properties.models import Site
-            try:
-                site = Site.objects.get(id=site_id)
-            except Site.DoesNotExist:
-                raise ValidationError({"site_id": "Invalid site_id."})
+        # Create ScopeMembership (Org/Company/Entity admin) if scope_id + role_id provided
+        membership = None
+        if scope_id and role_id:
+            scope = models.TenantScope.objects.get(id=scope_id)
+            role_obj = models.Role.objects.get(id=role_id, scope=scope)
 
-            # Get or create site scope
-            scope, _ = models.TenantScope.objects.get_or_create(
-                scope_type=models.TenantScope.ScopeType.SITE,
-                site=site,
-                defaults={
-                    "name": site.name,
-                    "code": f"site-{site.id}",
-                }
-            )
+            # Validate creator has access to assign users to this scope
+            active_scope = get_active_scope(request)
+            if active_scope:
+                child_scopes = active_scope.get_child_scopes()
+                allowed_ids = {s.id for s in child_scopes} | {active_scope.id}
+                if scope_id not in allowed_ids:
+                    raise ValidationError({
+                        "scope_id": f"You can only assign users to your active scope (id={active_scope.id}) or its child scopes."
+                    })
 
-            # Create user scope
-            user_scope = models.UserScope.objects.create(
+            membership = models.ScopeMembership.objects.create(
                 user=user,
                 scope=scope,
-                can_view=can_view,
-                can_create=can_create,
-                can_edit=can_edit,
-                can_delete=can_delete,
+                role=role_obj
             )
-
-            # Store credential
-            models.UserCredential.objects.create(
-                user=user,
-                scope=scope,
-                password_plain=password
+            # Sync UserProfile.role from ScopeMembership role (admin/manager/staff/viewer)
+            role_code_to_profile = {
+                "admin": models.UserProfile.UserRole.ADMIN,
+                "manager": models.UserProfile.UserRole.MANAGER,
+                "staff": models.UserProfile.UserRole.MANAGER,  # no STAFF in UserRole, use MANAGER
+                "viewer": models.UserProfile.UserRole.VIEWER,
+            }
+            profile.role = role_code_to_profile.get(
+                role_obj.code.lower(),
+                models.UserProfile.UserRole.MANAGER
             )
+            profile.save(update_fields=["role"])
 
         out = serializers.UserDetailSerializer(user).data
         out["password_plain"] = password
-        if user_scope:
-            out["user_scope_id"] = user_scope.id
+        if membership:
+            out["membership_id"] = membership.id
 
         return Response(out, status=status.HTTP_201_CREATED)
-
-
-# ===================== Assign Site Endpoint =====================
-
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-def assign_site(request):
-    """
-    Assign a site to a user with permissions.
-    Can create new user or assign to existing user.
-
-    Request body:
-    {
-        "user_id": 123,  // OR
-        "user": { "email": "...", "username": "...", "role": "MANAGER", ... },
-        "site_id": 456,
-        "can_view": true,
-        "can_create": false,
-        "can_edit": false,
-        "can_delete": false
-    }
-
-    Response:
-    {
-        "user": 123,
-        "user_detail": { ... },
-        "user_scope_id": 789
-    }
-    """
-    serializer = serializers.AssignSiteSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
-    data = serializer.validated_data
-
-    site_id = data["site_id"]
-    can_view = data.get("can_view", True)
-    can_create = data.get("can_create", False)
-    can_edit = data.get("can_edit", False)
-    can_delete = data.get("can_delete", False)
-
-    # Get site and create scope
-    from apps.properties.models import Site
-    try:
-        site = Site.objects.get(id=site_id)
-    except Site.DoesNotExist:
-        raise ValidationError({"site_id": "Invalid site_id."})
-
-    scope, _ = models.TenantScope.objects.get_or_create(
-        scope_type=models.TenantScope.ScopeType.SITE,
-        site=site,
-        defaults={
-            "name": site.name,
-            "code": f"site-{site.id}",
-        }
-    )
-
-    with transaction.atomic():
-        if data.get("user_id"):
-            # Existing user
-            try:
-                user = User.objects.get(id=data["user_id"])
-            except User.DoesNotExist:
-                raise ValidationError({"user_id": "Invalid user_id."})
-
-            # Create or update user scope
-            user_scope, created = models.UserScope.objects.update_or_create(
-                user=user,
-                scope=scope,
-                defaults={
-                    "can_view": can_view,
-                    "can_create": can_create,
-                    "can_edit": can_edit,
-                    "can_delete": can_delete,
-                    "is_active": True,
-                }
-            )
-        else:
-            # Create new user
-            user_data = data["user"]
-            password = user_data.pop("password", None) or generate_password()
-            role = user_data.pop("role", models.UserProfile.UserRole.MANAGER)
-            profile_json = user_data.pop("profile_json", {})
-
-            # Remove site assignment fields (handled here)
-            user_data.pop("site_id", None)
-            user_data.pop("can_view", None)
-            user_data.pop("can_create", None)
-            user_data.pop("can_edit", None)
-            user_data.pop("can_delete", None)
-
-            user = User(**user_data)
-            user.set_password(password)
-            user.save()
-
-            # Create profile
-            models.UserProfile.objects.create(
-                user=user,
-                role=role,
-                profile_json=profile_json
-            )
-
-            # Create user scope
-            user_scope = models.UserScope.objects.create(
-                user=user,
-                scope=scope,
-                can_view=can_view,
-                can_create=can_create,
-                can_edit=can_edit,
-                can_delete=can_delete,
-            )
-
-            # Store credential
-            models.UserCredential.objects.create(
-                user=user,
-                scope=scope,
-                password_plain=password
-            )
-
-    response_data = {
-        "user": user.id,
-        "user_detail": serializers.UserDetailSerializer(user).data,
-        "user_scope_id": user_scope.id,
-    }
-
-    if "password" not in data.get("user", {}):
-        response_data["password_plain"] = password if "password" in locals() else None
-
-    return Response(response_data, status=status.HTTP_201_CREATED)
 
 
 # ===================== Change Password Endpoint =====================

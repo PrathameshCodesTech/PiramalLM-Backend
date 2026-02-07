@@ -3,6 +3,39 @@ from apps.tenants.serializers import TenantCompanyListSerializer, TenantContactS
 from . import models
 
 
+# ===================== Escalation Template Serializers =====================
+
+class EscalationTemplateSerializer(serializers.ModelSerializer):
+    """Full serializer for EscalationTemplate create/update."""
+
+    class Meta:
+        model = models.EscalationTemplate
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+
+class EscalationTemplateListSerializer(serializers.ModelSerializer):
+    """List serializer for EscalationTemplate."""
+
+    class Meta:
+        model = models.EscalationTemplate
+        fields = (
+            "id", "name", "description", "escalation_type", "frequency",
+            "status", "applicability", "scope", "created_at"
+        )
+
+
+class EscalationTemplateDetailSerializer(serializers.ModelSerializer):
+    """Detail serializer for EscalationTemplate."""
+
+    class Meta:
+        model = models.EscalationTemplate
+        fields = "__all__"
+
+
 # ===================== Term Serializers =====================
 
 class LeaseTermDatesSerializer(serializers.ModelSerializer):
@@ -76,6 +109,9 @@ class LeaseBillingSerializer(serializers.ModelSerializer):
 
 
 class LeaseTerminationSerializer(serializers.ModelSerializer):
+    tenant_penalty_display = serializers.SerializerMethodField()
+    landlord_compensation_display = serializers.SerializerMethodField()
+
     class Meta:
         model = models.LeaseTermination
         fields = "__all__"
@@ -83,6 +119,262 @@ class LeaseTerminationSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+
+    def get_tenant_penalty_display(self, obj):
+        return obj.get_tenant_penalty_display()
+
+    def get_landlord_compensation_display(self, obj):
+        return obj.get_landlord_compensation_display()
+
+
+# ===================== Clause Configuration Serializers =====================
+
+class LeaseRenewalOptionSerializer(serializers.ModelSerializer):
+    current_cycle_config = serializers.SerializerMethodField()
+    next_cycle_config = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.LeaseRenewalOption
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+    def get_current_cycle_config(self, obj):
+        return obj.get_current_cycle_config()
+
+    def get_next_cycle_config(self, obj):
+        return obj.get_next_cycle_config()
+
+
+class LeaseSubletSignageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.LeaseSubletSignage
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+
+class LeaseExclusivitySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.LeaseExclusivity
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+
+class LeaseInsuranceRequirementSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.LeaseInsuranceRequirement
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+
+class LeaseDisputeResolutionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.LeaseDisputeResolution
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+
+# ===================== Amendment Serializers =====================
+
+class AmendmentApprovalSerializer(serializers.ModelSerializer):
+    approver_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.AmendmentApproval
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+    def get_approver_name(self, obj):
+        if obj.approver:
+            return obj.approver.get_full_name() or obj.approver.email
+        return None
+
+
+class AmendmentAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.SerializerMethodField()
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.AmendmentAttachment
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at",
+            "file_size", "uploaded_by"
+        )
+
+    def get_uploaded_by_name(self, obj):
+        if obj.uploaded_by:
+            return obj.uploaded_by.get_full_name() or obj.uploaded_by.email
+        return None
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
+class LeaseAmendmentListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for list views."""
+    agreement_lease_id = serializers.CharField(source="agreement.lease_id", read_only=True)
+
+    class Meta:
+        model = models.LeaseAmendment
+        fields = (
+            "id", "amendment_id", "agreement", "agreement_lease_id",
+            "amendment_type", "title", "previous_version", "new_version",
+            "amendment_date", "effective_from", "approval_status", "created_at"
+        )
+
+
+class LeaseAmendmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.LeaseAmendment
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at",
+            "amendment_id"
+        )
+
+
+class LeaseAmendmentDetailSerializer(serializers.ModelSerializer):
+    """Full detail serializer with approvals and attachments."""
+    agreement_lease_id = serializers.CharField(source="agreement.lease_id", read_only=True)
+    approvals = AmendmentApprovalSerializer(many=True, read_only=True)
+    attachments = AmendmentAttachmentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = models.LeaseAmendment
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+
+class LeaseAmendmentCreateSerializer(serializers.ModelSerializer):
+    """Serializer for creating amendments."""
+
+    class Meta:
+        model = models.LeaseAmendment
+        fields = (
+            "agreement", "amendment_type", "title", "previous_version",
+            "new_version", "is_major_version", "amendment_date", "effective_from",
+            "effective_to", "changes_summary", "description", "reason", "initiated_by"
+        )
+
+
+# ===================== Linked Document Serializers =====================
+
+class DocumentApprovalSerializer(serializers.ModelSerializer):
+    approver_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.DocumentApproval
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+    def get_approver_name(self, obj):
+        if obj.approver:
+            return obj.approver.get_full_name() or obj.approver.email
+        return None
+
+
+class LeaseLinkedDocumentListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for list views."""
+    uploaded_by_name = serializers.SerializerMethodField()
+    is_expiring_soon = serializers.ReadOnlyField()
+    is_expired = serializers.ReadOnlyField()
+
+    class Meta:
+        model = models.LeaseLinkedDocument
+        fields = (
+            "id", "agreement", "title", "category", "status",
+            "version", "document_date", "expiry_date", "requires_renewal",
+            "is_expiring_soon", "is_expired", "uploaded_by_name", "created_at"
+        )
+
+    def get_uploaded_by_name(self, obj):
+        if obj.uploaded_by:
+            return obj.uploaded_by.get_full_name() or obj.uploaded_by.email
+        return None
+
+
+class LeaseLinkedDocumentSerializer(serializers.ModelSerializer):
+    is_expiring_soon = serializers.ReadOnlyField()
+    is_expired = serializers.ReadOnlyField()
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.LeaseLinkedDocument
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at",
+            "file_size", "uploaded_by"
+        )
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
+class LeaseLinkedDocumentDetailSerializer(serializers.ModelSerializer):
+    """Full detail serializer with approvals."""
+    is_expiring_soon = serializers.ReadOnlyField()
+    is_expired = serializers.ReadOnlyField()
+    file_url = serializers.SerializerMethodField()
+    uploaded_by_name = serializers.SerializerMethodField()
+    approvals = DocumentApprovalSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = models.LeaseLinkedDocument
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+    def get_uploaded_by_name(self, obj):
+        if obj.uploaded_by:
+            return obj.uploaded_by.get_full_name() or obj.uploaded_by.email
+        return None
 
 
 # ===================== Allocation Serializers =====================
@@ -212,10 +504,21 @@ class AgreementDetailSerializer(serializers.ModelSerializer):
     billing = LeaseBillingSerializer(read_only=True)
     termination = LeaseTerminationSerializer(read_only=True)
 
+    # Clause Configuration (OneToOne relations)
+    renewal_option = serializers.SerializerMethodField()
+    sublet_signage = serializers.SerializerMethodField()
+    exclusivity = serializers.SerializerMethodField()
+    insurance_requirement = serializers.SerializerMethodField()
+    dispute_resolution = serializers.SerializerMethodField()
+
     # Collections
     unit_allocations = UnitAllocationSerializer(many=True, read_only=True)
     documents = LeaseDocumentSerializer(many=True, read_only=True)
     notes_list = LeaseNoteSerializer(many=True, read_only=True)
+
+    # Amendment & Document collections
+    amendments = serializers.SerializerMethodField()
+    linked_documents = serializers.SerializerMethodField()
 
     # Computed fields
     total_allocated_area = serializers.SerializerMethodField()
@@ -253,6 +556,44 @@ class AgreementDetailSerializer(serializers.ModelSerializer):
         except (models.LeaseFinancials.DoesNotExist, models.LeaseCAM.DoesNotExist):
             return 0
 
+    def get_renewal_option(self, obj):
+        try:
+            return LeaseRenewalOptionSerializer(obj.renewal_option).data
+        except models.LeaseRenewalOption.DoesNotExist:
+            return None
+
+    def get_sublet_signage(self, obj):
+        try:
+            return LeaseSubletSignageSerializer(obj.sublet_signage).data
+        except models.LeaseSubletSignage.DoesNotExist:
+            return None
+
+    def get_exclusivity(self, obj):
+        try:
+            return LeaseExclusivitySerializer(obj.exclusivity).data
+        except models.LeaseExclusivity.DoesNotExist:
+            return None
+
+    def get_insurance_requirement(self, obj):
+        try:
+            return LeaseInsuranceRequirementSerializer(obj.insurance_requirement).data
+        except models.LeaseInsuranceRequirement.DoesNotExist:
+            return None
+
+    def get_dispute_resolution(self, obj):
+        try:
+            return LeaseDisputeResolutionSerializer(obj.dispute_resolution).data
+        except models.LeaseDisputeResolution.DoesNotExist:
+            return None
+
+    def get_amendments(self, obj):
+        amendments = obj.amendments.all().order_by("-amendment_date")[:5]
+        return LeaseAmendmentListSerializer(amendments, many=True).data
+
+    def get_linked_documents(self, obj):
+        docs = obj.linked_documents.all()[:10]
+        return LeaseLinkedDocumentListSerializer(docs, many=True).data
+
 
 # ===================== Bundle Serializers =====================
 
@@ -262,6 +603,7 @@ class LeaseTermsBundleSerializer(serializers.Serializer):
     Used by the /agreements/{id}/bundle/ endpoint.
     """
 
+    # Core Terms
     term_dates = LeaseTermDatesSerializer(required=False)
     rent_free = LeaseRentFreeSerializer(required=False)
     financials = LeaseFinancialsSerializer(required=False)
@@ -271,6 +613,13 @@ class LeaseTermsBundleSerializer(serializers.Serializer):
     billing = LeaseBillingSerializer(required=False)
     termination = LeaseTerminationSerializer(required=False)
     unit_allocations = UnitAllocationCreateSerializer(many=True, required=False)
+
+    # Clause Configuration
+    renewal_option = LeaseRenewalOptionSerializer(required=False)
+    sublet_signage = LeaseSubletSignageSerializer(required=False)
+    exclusivity = LeaseExclusivitySerializer(required=False)
+    insurance_requirement = LeaseInsuranceRequirementSerializer(required=False)
+    dispute_resolution = LeaseDisputeResolutionSerializer(required=False)
 
     def update_or_create_term(self, agreement, model_class, data, scope, user):
         """Helper to update or create a term model."""
@@ -354,6 +703,32 @@ class LeaseTermsBundleSerializer(serializers.Serializer):
                     created_by=user,
                     **alloc_data
                 )
+
+        # Handle clause configuration models
+        if "renewal_option" in data:
+            self.update_or_create_term(
+                agreement, models.LeaseRenewalOption, data["renewal_option"], scope, user
+            )
+
+        if "sublet_signage" in data:
+            self.update_or_create_term(
+                agreement, models.LeaseSubletSignage, data["sublet_signage"], scope, user
+            )
+
+        if "exclusivity" in data:
+            self.update_or_create_term(
+                agreement, models.LeaseExclusivity, data["exclusivity"], scope, user
+            )
+
+        if "insurance_requirement" in data:
+            self.update_or_create_term(
+                agreement, models.LeaseInsuranceRequirement, data["insurance_requirement"], scope, user
+            )
+
+        if "dispute_resolution" in data:
+            self.update_or_create_term(
+                agreement, models.LeaseDisputeResolution, data["dispute_resolution"], scope, user
+            )
 
         return agreement
 

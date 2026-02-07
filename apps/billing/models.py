@@ -1,19 +1,26 @@
 from django.db import models
 from django.conf import settings
-from django.core.validators import MinValueValidator
+from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.exceptions import ValidationError
 from decimal import Decimal
 from apps.core.models import TenantModel
 
 
+# =============================================================================
+# AGEING BUCKET CONFIGURATION (Tab 4)
+# =============================================================================
+
 class AgeingBucket(TenantModel):
     """
     Defines ageing buckets for AR aging reports.
-    These are scope-level configurations.
+    Scope-level configuration.
+
+    UI: Ageing Bucket Configuration tab - Bucket list
     """
 
     label = models.CharField(
         max_length=50,
-        help_text="Display label e.g., '0-30 Days', '31-60 Days'"
+        help_text="Display label e.g., 'Current (0-30)', '31-60 Days'"
     )
     from_days = models.PositiveIntegerField(
         help_text="Start of bucket range (inclusive)"
@@ -21,16 +28,30 @@ class AgeingBucket(TenantModel):
     to_days = models.PositiveIntegerField(
         null=True,
         blank=True,
-        help_text="End of bucket range (inclusive). Null means open-ended (e.g., 90+ days)"
+        help_text="End of bucket range (inclusive). Null means open-ended (e.g., 121+ days)"
+    )
+    reporting_label = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Label for reports e.g., 'Current', '31-60 Days'"
+    )
+    color_code = models.CharField(
+        max_length=20,
+        default="Gray",
+        help_text="Color name for UI display: Blue, Purple, Orange, Red, Gray"
+    )
+    include_in_dso = models.BooleanField(
+        default=True,
+        help_text="Include this bucket in Days Sales Outstanding calculation"
     )
     sort_order = models.PositiveIntegerField(
         default=0,
         help_text="Display order of buckets"
     )
-    color_code = models.CharField(
-        max_length=7,
-        default="#6B7280",
-        help_text="Hex color for UI display"
+    status = models.CharField(
+        max_length=20,
+        choices=[("ACTIVE", "Active"), ("INACTIVE", "Inactive")],
+        default="ACTIVE"
     )
 
     class Meta:
@@ -49,11 +70,768 @@ class AgeingBucket(TenantModel):
             return f"{self.label} ({self.from_days}-{self.to_days} days)"
         return f"{self.label} ({self.from_days}+ days)"
 
+    def save(self, *args, **kwargs):
+        if not self.reporting_label:
+            self.reporting_label = self.label
+        super().save(*args, **kwargs)
+
+
+class AgeingConfig(TenantModel):
+    """
+    Scope-level ageing configuration settings.
+    Controls how ageing is calculated and displayed.
+
+    UI: Ageing Bucket Configuration tab - Ageing Logic & Display sections
+    """
+
+    class ReferenceDateType(models.TextChoices):
+        INVOICE_DATE = "INVOICE_DATE", "Invoice Date"
+        DUE_DATE = "DUE_DATE", "Due Date"
+
+    class CurrencyHandling(models.TextChoices):
+        DOCUMENT_CURRENCY = "DOCUMENT_CURRENCY", "Document Currency"
+        BASE_CURRENCY = "BASE_CURRENCY", "Base Currency"
+
+    # Ageing Logic
+    reference_date = models.CharField(
+        max_length=20,
+        choices=ReferenceDateType.choices,
+        default=ReferenceDateType.INVOICE_DATE,
+        help_text="Which date to use for ageing calculation"
+    )
+    currency_handling = models.CharField(
+        max_length=20,
+        choices=CurrencyHandling.choices,
+        default=CurrencyHandling.DOCUMENT_CURRENCY,
+        help_text="How to handle multi-currency for ageing"
+    )
+    include_disputed_in_standard_ageing = models.BooleanField(
+        default=False,
+        help_text="Include disputed invoices in standard ageing"
+    )
+    exclude_credit_blocked_customers = models.BooleanField(
+        default=True,
+        help_text="Exclude credit-blocked customers from ageing"
+    )
+
+    # Display & Reporting
+    show_on_ar_dashboard = models.BooleanField(
+        default=True,
+        help_text="Show ageing buckets on AR dashboard"
+    )
+    show_in_customer_statements = models.BooleanField(
+        default=True,
+        help_text="Show bucket totals in customer statements"
+    )
+    enable_separate_disputed_ageing = models.BooleanField(
+        default=False,
+        help_text="Enable separate ageing for disputed amounts"
+    )
+
+    class Meta:
+        verbose_name = "Ageing Configuration"
+        verbose_name_plural = "Ageing Configurations"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope"],
+                name="unique_ageing_config_per_scope"
+            )
+        ]
+
+    def __str__(self):
+        return f"Ageing Config - {self.scope}"
+
+
+# =============================================================================
+# SITE BILLING CONFIGURATION (Tab 1)
+# =============================================================================
+
+class SiteBillingConfig(TenantModel):
+    """
+    Site-level billing configuration.
+    Controls invoice generation, payment terms, tax settings, and GL mapping.
+
+    UI: Billing & Invoice Rules tab - Detail view
+    """
+
+    class InvoiceGenerationMode(models.TextChoices):
+        AUTO = "AUTO", "Auto"
+        MANUAL = "MANUAL", "Manual"
+
+    class InvoiceGranularity(models.TextChoices):
+        PER_CHARGE_TYPE = "PER_CHARGE_TYPE", "Per-charge-type Invoice"
+        CONSOLIDATED = "CONSOLIDATED", "Consolidated tenant/month Invoice"
+
+    class GSTSplitLogic(models.TextChoices):
+        IGST = "IGST", "IGST"
+        CGST_SGST = "CGST_SGST", "CGST+SGST"
+
+    class DefaultPaymentTerm(models.TextChoices):
+        NET_7 = "NET_7", "Net 7"
+        NET_15 = "NET_15", "Net 15"
+        NET_30 = "NET_30", "Net 30"
+        NET_45 = "NET_45", "Net 45"
+        NET_60 = "NET_60", "Net 60"
+        DUE_ON_RECEIPT = "DUE_ON_RECEIPT", "Due on Receipt"
+
+    site = models.OneToOneField(
+        "properties.Site",
+        on_delete=models.CASCADE,
+        related_name="billing_config"
+    )
+
+    # =========================================================================
+    # NUMBERING & COUNTERS
+    # =========================================================================
+    invoice_pattern = models.CharField(
+        max_length=100,
+        default="INV/{PROP}/{YEAR}/{COUNTER}",
+        help_text="Invoice number pattern. Tokens: {PROP}, {YEAR}, {MONTH}, {COUNTER}"
+    )
+    include_property_code = models.BooleanField(
+        default=True,
+        help_text="Include property code in invoice number"
+    )
+    include_year_token = models.BooleanField(
+        default=True,
+        help_text="Include year in invoice number"
+    )
+    current_counter = models.PositiveIntegerField(
+        default=1,
+        help_text="Current invoice counter value"
+    )
+    counter_reset_frequency = models.CharField(
+        max_length=20,
+        choices=[
+            ("NEVER", "Never"),
+            ("YEARLY", "Yearly"),
+            ("MONTHLY", "Monthly"),
+        ],
+        default="YEARLY",
+        help_text="When to reset the invoice counter"
+    )
+    counter_padding = models.PositiveIntegerField(
+        default=4,
+        help_text="Zero-padding for counter (4 = 0001)"
+    )
+
+    # =========================================================================
+    # INVOICE GENERATION RULES
+    # =========================================================================
+    generation_mode = models.CharField(
+        max_length=10,
+        choices=InvoiceGenerationMode.choices,
+        default=InvoiceGenerationMode.AUTO,
+        help_text="Auto or Manual invoice generation"
+    )
+    generation_day_of_month = models.PositiveIntegerField(
+        default=1,
+        validators=[MinValueValidator(1), MaxValueValidator(28)],
+        help_text="Day of month to generate invoices (1-28)"
+    )
+    relative_generation_rule = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+        help_text="Relative rule e.g., 'Day after due date', '5 days before due'"
+    )
+    invoice_granularity = models.CharField(
+        max_length=20,
+        choices=InvoiceGranularity.choices,
+        default=InvoiceGranularity.CONSOLIDATED,
+        help_text="How to group charges on invoices"
+    )
+    billing_address_override = models.BooleanField(
+        default=False,
+        help_text="Allow billing address override on invoices"
+    )
+    default_gst_invoice_flag = models.BooleanField(
+        default=True,
+        help_text="Default GST invoice flag for new invoices"
+    )
+
+    # =========================================================================
+    # REQUIRED HEADER FIELDS (stored as JSON for flexibility)
+    # =========================================================================
+    header_fields = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Required header fields configuration: {field_name: is_required}"
+    )
+    # Default structure:
+    # {
+    #     "lease_id": true,
+    #     "property": true,
+    #     "unit": true,
+    #     "tenant": true,
+    #     "billing_period": true,
+    #     "billing_address": false,
+    #     "gst_invoice_flag": true
+    # }
+
+    # =========================================================================
+    # PAYMENT TERMS
+    # =========================================================================
+    default_payment_term = models.CharField(
+        max_length=20,
+        choices=DefaultPaymentTerm.choices,
+        default=DefaultPaymentTerm.NET_30,
+        help_text="Default payment terms"
+    )
+    grace_period_days = models.PositiveIntegerField(
+        default=7,
+        help_text="Grace period in days after due date"
+    )
+    early_payment_discount_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Early payment discount percentage"
+    )
+    early_payment_discount_days = models.PositiveIntegerField(
+        default=0,
+        help_text="Days within which early payment discount applies"
+    )
+    late_fee_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Late fee percentage"
+    )
+    late_fee_flat_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="Flat late fee amount (alternative to percentage)"
+    )
+    interest_rate_annual = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Annual interest rate for overdue invoices"
+    )
+
+    # =========================================================================
+    # TAX SETTINGS
+    # =========================================================================
+    default_gst_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("18.00"),
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Default GST rate percentage"
+    )
+    gst_split_logic = models.CharField(
+        max_length=10,
+        choices=GSTSplitLogic.choices,
+        default=GSTSplitLogic.IGST,
+        help_text="GST split logic: IGST or CGST+SGST"
+    )
+    state_tax_rules = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="State-based tax splitting rules"
+    )
+    # Structure:
+    # [
+    #     {"state": "MH", "split": "CGST_SGST", "cgst_rate": 9, "sgst_rate": 9},
+    #     {"state": "KA", "split": "CGST_SGST", "cgst_rate": 9, "sgst_rate": 9}
+    # ]
+
+    # =========================================================================
+    # LEDGER MAPPING
+    # =========================================================================
+    revenue_gl = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Revenue GL code e.g., 4000-RENT-REV"
+    )
+    gst_output_gl = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="GST Output GL code e.g., 2100-GST-OUT"
+    )
+    gst_input_gl = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="GST Input GL code e.g., 2100-GST-IN"
+    )
+    receivables_gl = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Receivables GL code e.g., 1200-AR"
+    )
+    late_fee_gl = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Late Fee GL code"
+    )
+    interest_gl = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Interest Income GL code"
+    )
+
+    class Meta:
+        verbose_name = "Site Billing Configuration"
+        verbose_name_plural = "Site Billing Configurations"
+
+    def __str__(self):
+        return f"Billing Config - {self.site.name}"
+
+    def clean(self):
+        super().clean()
+        if self.site_id and self.scope_id and self.site.scope_id != self.scope_id:
+            raise ValidationError("SiteBillingConfig scope must match Site scope.")
+
+    def get_next_invoice_number(self):
+        """Generate next invoice number based on pattern."""
+        from datetime import datetime
+        now = datetime.now()
+
+        number = self.invoice_pattern
+        if self.include_property_code:
+            number = number.replace("{PROP}", self.site.code)
+        else:
+            number = number.replace("{PROP}/", "").replace("{PROP}", "")
+
+        if self.include_year_token:
+            number = number.replace("{YEAR}", str(now.year))
+        else:
+            number = number.replace("{YEAR}/", "").replace("{YEAR}", "")
+
+        number = number.replace("{MONTH}", f"{now.month:02d}")
+        counter_str = str(self.current_counter).zfill(self.counter_padding)
+        number = number.replace("{COUNTER}", counter_str)
+
+        # Increment counter
+        self.current_counter += 1
+        self.save(update_fields=["current_counter"])
+
+        return number
+
+
+# =============================================================================
+# BILLING RULES (Tab 1 - List view)
+# =============================================================================
+
+class BillingRule(TenantModel):
+    """
+    Master billing rules that can be applied at Lease or Property level.
+
+    UI: Billing & Invoice Rules tab - Rules list
+    """
+
+    class RuleCategory(models.TextChoices):
+        RENTAL = "RENTAL", "Rental"
+        CONTRACT = "CONTRACT", "Contract"
+        SERVICE = "SERVICE", "Service"
+        UTILITY = "UTILITY", "Utility"
+
+    class AppliesTo(models.TextChoices):
+        LEASE = "LEASE", "Lease"
+        PROPERTY = "PROPERTY", "Property"
+
+    class RuleStatus(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        DRAFT = "DRAFT", "Draft"
+        INACTIVE = "INACTIVE", "Inactive"
+
+    rule_id = models.CharField(
+        max_length=20,
+        help_text="Auto-generated rule ID e.g., BR-001"
+    )
+    name = models.CharField(
+        max_length=100,
+        help_text="Rule name e.g., 'Late Payment Fee'"
+    )
+    description = models.TextField(
+        blank=True,
+        help_text="Detailed description of the rule"
+    )
+    category = models.CharField(
+        max_length=20,
+        choices=RuleCategory.choices,
+        default=RuleCategory.RENTAL
+    )
+    applies_to = models.CharField(
+        max_length=20,
+        choices=AppliesTo.choices,
+        default=AppliesTo.LEASE,
+        help_text="Whether rule applies to Lease or Property level"
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=RuleStatus.choices,
+        default=RuleStatus.DRAFT
+    )
+
+    # Rule configuration (flexible JSON)
+    rule_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Rule-specific configuration"
+    )
+
+    # Ownership
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="owned_billing_rules"
+    )
+
+    class Meta:
+        verbose_name = "Billing Rule"
+        verbose_name_plural = "Billing Rules"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope", "rule_id"],
+                name="unique_billing_rule_id_per_scope"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.rule_id} - {self.name}"
+
+    def save(self, *args, **kwargs):
+        if not self.rule_id:
+            # Auto-generate rule_id
+            last_rule = BillingRule.objects.filter(scope=self.scope).order_by("-id").first()
+            if last_rule and last_rule.rule_id:
+                try:
+                    last_num = int(last_rule.rule_id.split("-")[1])
+                    self.rule_id = f"BR-{last_num + 1:03d}"
+                except (IndexError, ValueError):
+                    self.rule_id = "BR-001"
+            else:
+                self.rule_id = "BR-001"
+        super().save(*args, **kwargs)
+
+
+# =============================================================================
+# DISPUTE RULES (Tab 5)
+# =============================================================================
+
+class DisputeRule(TenantModel):
+    """
+    Rules for automatic dispute routing and handling.
+    Scope-level configuration.
+
+    UI: AR Rules (Dispute, Credit) tab - Dispute Rules section
+    """
+
+    class ConditionType(models.TextChoices):
+        INVOICE_AMOUNT = "INVOICE_AMOUNT", "Invoice Amount"
+        DISPUTE_COUNT = "DISPUTE_COUNT", "Dispute Count"
+        CUSTOMER_TYPE = "CUSTOMER_TYPE", "Customer Type"
+        INVOICE_AGE = "INVOICE_AGE", "Invoice Age (Days)"
+        DISPUTE_AMOUNT = "DISPUTE_AMOUNT", "Dispute Amount"
+
+    class Operator(models.TextChoices):
+        GREATER_THAN = "GT", "> (Greater Than)"
+        LESS_THAN = "LT", "< (Less Than)"
+        EQUAL = "EQ", "= (Equal)"
+        GREATER_EQUAL = "GTE", ">= (Greater or Equal)"
+        LESS_EQUAL = "LTE", "<= (Less or Equal)"
+        NOT_EQUAL = "NE", "!= (Not Equal)"
+
+    class RuleStatus(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        INACTIVE = "INACTIVE", "Inactive"
+
+    name = models.CharField(
+        max_length=100,
+        help_text="Rule name e.g., 'High Value Dispute'"
+    )
+    description = models.TextField(
+        blank=True,
+        help_text="Brief description of the rule"
+    )
+
+    # Condition
+    condition_type = models.CharField(
+        max_length=30,
+        choices=ConditionType.choices,
+        default=ConditionType.INVOICE_AMOUNT
+    )
+    operator = models.CharField(
+        max_length=10,
+        choices=Operator.choices,
+        default=Operator.GREATER_THAN
+    )
+    threshold_value = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        help_text="Threshold value for condition"
+    )
+    threshold_currency = models.CharField(
+        max_length=3,
+        default="INR",
+        help_text="Currency for amount thresholds"
+    )
+
+    # For time-based conditions (e.g., disputes in last X days)
+    time_window_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Time window in days for count-based conditions"
+    )
+
+    # Action
+    action_description = models.CharField(
+        max_length=255,
+        help_text="Action to take e.g., 'Auto route to Finance Manager'"
+    )
+    route_to_role = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Role to route dispute to e.g., 'AR Manager', 'Finance Manager'"
+    )
+    route_to_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="dispute_route_rules",
+        help_text="Specific user to route dispute to"
+    )
+    auto_resolve = models.BooleanField(
+        default=False,
+        help_text="Automatically resolve disputes matching this rule"
+    )
+    auto_resolve_action = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Action for auto-resolve e.g., 'Apply customer credit'"
+    )
+    require_approval = models.BooleanField(
+        default=False,
+        help_text="Require manager approval for disputes matching this rule"
+    )
+    flag_customer = models.BooleanField(
+        default=False,
+        help_text="Flag customer when dispute matches this rule"
+    )
+
+    # Priority & Status
+    priority = models.PositiveIntegerField(
+        default=1,
+        help_text="Rule execution priority (lower = higher priority)"
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=RuleStatus.choices,
+        default=RuleStatus.ACTIVE
+    )
+
+    class Meta:
+        verbose_name = "Dispute Rule"
+        verbose_name_plural = "Dispute Rules"
+        ordering = ["priority", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope", "name"],
+                name="unique_dispute_rule_name_per_scope"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.name} (Priority: {self.priority})"
+
+
+# =============================================================================
+# CREDIT RULES (Tab 5)
+# =============================================================================
+
+class CreditRule(TenantModel):
+    """
+    Rules for automatic credit note creation and approval.
+    Scope-level configuration.
+
+    UI: AR Rules (Dispute, Credit) tab - Credit Rules section
+    """
+
+    class TriggerType(models.TextChoices):
+        PAYMENT_VARIANCE = "PAYMENT_VARIANCE", "Payment Variance"
+        DISCOUNT_REQUEST = "DISCOUNT_REQUEST", "Approved Discount Request"
+        RETURN_REQUEST = "RETURN_REQUEST", "Validated Return Request"
+        BILLING_ERROR = "BILLING_ERROR", "Billing Error"
+        SERVICE_CREDIT = "SERVICE_CREDIT", "Service Credit"
+        GOODWILL = "GOODWILL", "Goodwill Adjustment"
+
+    class VarianceBasis(models.TextChoices):
+        PERCENTAGE = "PERCENTAGE", "Percentage"
+        FIXED_AMOUNT = "FIXED_AMOUNT", "Fixed Amount"
+
+    class ApprovalLevel(models.TextChoices):
+        AR_EXECUTIVE = "AR_EXECUTIVE", "AR Executive"
+        AR_SUPERVISOR = "AR_SUPERVISOR", "AR Supervisor"
+        AR_MANAGER = "AR_MANAGER", "AR Manager"
+        FINANCE_HEAD = "FINANCE_HEAD", "Finance Head"
+        OPERATIONS_MANAGER = "OPERATIONS_MANAGER", "Operations Manager"
+        CFO = "CFO", "CFO"
+
+    class RuleStatus(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        INACTIVE = "INACTIVE", "Inactive"
+
+    name = models.CharField(
+        max_length=100,
+        help_text="Rule name e.g., 'Short Payment Adjustment'"
+    )
+    description = models.TextField(
+        blank=True,
+        help_text="Brief description of the rule"
+    )
+
+    # Trigger
+    trigger_type = models.CharField(
+        max_length=30,
+        choices=TriggerType.choices,
+        default=TriggerType.PAYMENT_VARIANCE
+    )
+    variance_threshold = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Variance threshold value"
+    )
+    variance_basis = models.CharField(
+        max_length=20,
+        choices=VarianceBasis.choices,
+        default=VarianceBasis.PERCENTAGE,
+        help_text="How variance is measured"
+    )
+    max_credit_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Maximum credit note amount for this rule"
+    )
+
+    # Approval & Posting
+    approval_level = models.CharField(
+        max_length=30,
+        choices=ApprovalLevel.choices,
+        default=ApprovalLevel.AR_SUPERVISOR,
+        help_text="Who needs to approve credit notes from this rule"
+    )
+    auto_approve = models.BooleanField(
+        default=False,
+        help_text="Auto-approve credit notes matching this rule"
+    )
+    auto_post_to_gl = models.BooleanField(
+        default=False,
+        help_text="Automatically post approved credit notes to GL"
+    )
+    requires_documentation = models.BooleanField(
+        default=False,
+        help_text="Require supporting documentation for credit note"
+    )
+
+    # Status
+    status = models.CharField(
+        max_length=20,
+        choices=RuleStatus.choices,
+        default=RuleStatus.ACTIVE
+    )
+
+    class Meta:
+        verbose_name = "Credit Rule"
+        verbose_name_plural = "Credit Rules"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope", "name"],
+                name="unique_credit_rule_name_per_scope"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.name} - {self.get_approval_level_display()}"
+
+
+# =============================================================================
+# AR GLOBAL SETTINGS
+# =============================================================================
+
+class ARGlobalSettings(TenantModel):
+    """
+    Global AR settings for dispute and credit management.
+    Scope-level configuration.
+
+    UI: AR Rules (Dispute, Credit) tab - Toggle switches
+    """
+
+    enable_dispute_management = models.BooleanField(
+        default=True,
+        help_text="Enable dispute management workflow"
+    )
+    enable_credit_note_workflow = models.BooleanField(
+        default=True,
+        help_text="Enable credit note workflow"
+    )
+
+    # Dispute defaults
+    default_dispute_hold_collection = models.BooleanField(
+        default=True,
+        help_text="Default: Hold collection when invoice is disputed"
+    )
+    default_stop_interest_on_dispute = models.BooleanField(
+        default=True,
+        help_text="Default: Stop interest accrual during dispute"
+    )
+    default_stop_reminders_on_dispute = models.BooleanField(
+        default=True,
+        help_text="Default: Stop payment reminders during dispute"
+    )
+
+    # Credit note defaults
+    credit_note_requires_approval = models.BooleanField(
+        default=True,
+        help_text="Default: Require approval for credit notes"
+    )
+    max_auto_credit_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("2.00"),
+        help_text="Maximum percentage for auto-approved credit notes"
+    )
+
+    class Meta:
+        verbose_name = "AR Global Settings"
+        verbose_name_plural = "AR Global Settings"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope"],
+                name="unique_ar_global_settings_per_scope"
+            )
+        ]
+
+    def __str__(self):
+        return f"AR Settings - {self.scope}"
+
+
+# =============================================================================
+# EXISTING MODELS (Updated)
+# =============================================================================
 
 class ARRule(TenantModel):
     """
     Accounts Receivable rules for a lease agreement.
     Controls dispute handling, credit notes, and collection behavior.
+
+    Links to scope-level DisputeRule and CreditRule for automatic processing.
     """
 
     agreement = models.OneToOneField(
@@ -313,6 +1091,15 @@ class InvoiceLineItem(TenantModel):
         related_name="invoice_line_items"
     )
 
+    # Reference to CAM component if applicable
+    cam_component = models.ForeignKey(
+        "properties.CAMComponent",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="invoice_line_items"
+    )
+
     class Meta:
         verbose_name = "Invoice Line Item"
         verbose_name_plural = "Invoice Line Items"
@@ -419,6 +1206,7 @@ class CreditNote(TenantModel):
         GOODWILL = "GOODWILL", "Goodwill"
         SERVICE_ISSUE = "SERVICE_ISSUE", "Service Issue"
         EARLY_TERMINATION = "EARLY_TERMINATION", "Early Termination"
+        PAYMENT_VARIANCE = "PAYMENT_VARIANCE", "Payment Variance"
         OTHER = "OTHER", "Other"
 
     invoice = models.ForeignKey(
@@ -446,6 +1234,16 @@ class CreditNote(TenantModel):
         default=CreditNoteStatus.DRAFT
     )
 
+    # Linked Credit Rule (if auto-created)
+    credit_rule = models.ForeignKey(
+        CreditRule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="credit_notes",
+        help_text="Credit rule that triggered this credit note"
+    )
+
     # Approval
     approved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -456,6 +1254,10 @@ class CreditNote(TenantModel):
     )
     approved_at = models.DateTimeField(null=True, blank=True)
     rejection_reason = models.TextField(blank=True)
+
+    # GL Posting
+    posted_to_gl = models.BooleanField(default=False)
+    posted_at = models.DateTimeField(null=True, blank=True)
 
     # Application
     applied_at = models.DateTimeField(null=True, blank=True)

@@ -1,7 +1,10 @@
+from django.urls import path
 from rest_framework.routers import DefaultRouter
 from . import views
 
 router = DefaultRouter()
+
+# Existing viewsets
 router.register(r"ageing-buckets", views.AgeingBucketViewSet, basename="ageing-bucket")
 router.register(r"ar-rules", views.ARRuleViewSet, basename="ar-rule")
 router.register(r"invoices", views.InvoiceViewSet, basename="invoice")
@@ -11,4 +14,16 @@ router.register(r"invoice-schedules", views.InvoiceScheduleViewSet, basename="in
 router.register(r"ar-summaries", views.ARSummaryViewSet, basename="ar-summary")
 router.register(r"lease-rules", views.LeaseRulesViewSet, basename="lease-rules")
 
-urlpatterns = router.urls
+# New viewsets (Tab-based configuration)
+router.register(r"ageing-config", views.AgeingConfigViewSet, basename="ageing-config")
+router.register(r"site-billing-configs", views.SiteBillingConfigViewSet, basename="site-billing-config")
+router.register(r"billing-rules", views.BillingRuleViewSet, basename="billing-rule")
+router.register(r"dispute-rules", views.DisputeRuleViewSet, basename="dispute-rule")
+router.register(r"credit-rules", views.CreditRuleViewSet, basename="credit-rule")
+router.register(r"ar-global-settings", views.ARGlobalSettingsViewSet, basename="ar-global-settings")
+
+urlpatterns = router.urls + [
+    # Bundle endpoints for fetching all config at once
+    path("config/", views.BillingConfigBundleView.as_view(), name="billing-config-bundle"),
+    path("site/<int:site_id>/config/", views.SiteBillingConfigBundleView.as_view(), name="site-billing-config-bundle"),
+]

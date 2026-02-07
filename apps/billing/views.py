@@ -1,20 +1,662 @@
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.views import APIView
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
+from django.shortcuts import get_object_or_404
 from decimal import Decimal
 
-from apps.core.viewsets import ScopedViewSet
+from apps.core.viewsets import ScopedViewSet, InheritableScopedViewSet
 from . import models, serializers
 
 
-class AgeingBucketViewSet(ScopedViewSet):
+# =============================================================================
+# AGEING CONFIG VIEWS (Tab 4 - Ageing Logic)
+# =============================================================================
+
+class AgeingConfigViewSet(ScopedViewSet):
+    """
+    ViewSet for ageing configuration (scope-level).
+
+    Endpoints:
+    - GET /ageing-config/ - Get ageing config for scope
+    - POST /ageing-config/ - Create ageing config
+    - PATCH /ageing-config/ - Update ageing config
+    """
+
+    queryset = models.AgeingConfig.objects.all()
+    serializer_class = serializers.AgeingConfigSerializer
+
+    def get_serializer_class(self):
+        if self.action in ["update", "partial_update"]:
+            return serializers.AgeingConfigUpdateSerializer
+        return serializers.AgeingConfigSerializer
+
+    def list(self, request):
+        """Get ageing config for current scope (returns single object)."""
+        scope = self.get_active_scope()
+        try:
+            config = models.AgeingConfig.objects.get(scope=scope)
+            serializer = self.get_serializer(config)
+            return Response(serializer.data)
+        except models.AgeingConfig.DoesNotExist:
+            return Response(
+                {"detail": "Ageing config not found. Use POST to create."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    def create(self, request):
+        """Create ageing config for scope."""
+        scope = self.get_active_scope()
+
+        # Check if already exists
+        if models.AgeingConfig.objects.filter(scope=scope).exists():
+            return Response(
+                {"error": "Ageing config already exists for this scope. Use PATCH to update."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(scope=scope, created_by=request.user)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["patch"])
+    def update_config(self, request):
+        """Update ageing config for scope."""
+        scope = self.get_active_scope()
+        config, created = models.AgeingConfig.objects.get_or_create(
+            scope=scope,
+            defaults={"created_by": request.user}
+        )
+
+        serializer = serializers.AgeingConfigUpdateSerializer(
+            config, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save(updated_by=request.user)
+        return Response(serializer.data)
+
+
+# =============================================================================
+# SITE BILLING CONFIG VIEWS (Tab 1 - Billing & Invoice Rules)
+# =============================================================================
+
+class SiteBillingConfigViewSet(ScopedViewSet):
+    """
+    ViewSet for site-level billing configuration.
+
+    Endpoints:
+    - GET /site-billing-configs/ - List all site configs
+    - POST /site-billing-configs/ - Create site config
+    - GET /site-billing-configs/{id}/ - Get config details
+    - PATCH /site-billing-configs/{id}/ - Update config
+    - DELETE /site-billing-configs/{id}/ - Delete config
+    - GET /site-billing-configs/by-site/{site_id}/ - Get config for site
+    - POST /site-billing-configs/{id}/reset-counter/ - Reset invoice counter
+    """
+
+    queryset = models.SiteBillingConfig.objects.all()
+    serializer_class = serializers.SiteBillingConfigSerializer
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return serializers.SiteBillingConfigListSerializer
+        if self.action == "retrieve":
+            return serializers.SiteBillingConfigDetailSerializer
+        if self.action == "create":
+            return serializers.SiteBillingConfigCreateSerializer
+        return serializers.SiteBillingConfigSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        return queryset.select_related("site")
+
+    def perform_create(self, serializer):
+        scope = self.get_active_scope()
+        serializer.save(scope=scope, created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+    @action(detail=False, methods=["get"], url_path="by-site/(?P<site_id>[^/.]+)")
+    def by_site(self, request, site_id=None):
+        """Get billing config for a specific site."""
+        scope = self.get_active_scope()
+        try:
+            config = models.SiteBillingConfig.objects.get(
+                site_id=site_id,
+                scope=scope
+            )
+            serializer = serializers.SiteBillingConfigDetailSerializer(config)
+            return Response(serializer.data)
+        except models.SiteBillingConfig.DoesNotExist:
+            return Response(
+                {"error": "Billing config not found for this site"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    @action(detail=True, methods=["post"], url_path="reset-counter")
+    def reset_counter(self, request, pk=None):
+        """Reset invoice counter for site."""
+        config = self.get_object()
+        new_value = request.data.get("value", 1)
+        config.current_counter = new_value
+        config.save(update_fields=["current_counter"])
+        serializer = serializers.SiteBillingConfigDetailSerializer(config)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"], url_path="preview-invoice-number")
+    def preview_invoice_number(self, request, pk=None):
+        """Preview next invoice number without incrementing counter."""
+        config = self.get_object()
+        from datetime import datetime
+        now = datetime.now()
+
+        pattern = config.invoice_pattern
+        preview = pattern
+
+        if config.include_property_code:
+            preview = preview.replace("{PROP}", config.site.code)
+        else:
+            preview = preview.replace("{PROP}/", "").replace("{PROP}", "")
+
+        if config.include_year_token:
+            preview = preview.replace("{YEAR}", str(now.year))
+        else:
+            preview = preview.replace("{YEAR}/", "").replace("{YEAR}", "")
+
+        preview = preview.replace("{MONTH}", f"{now.month:02d}")
+        counter_str = str(config.current_counter).zfill(config.counter_padding)
+        preview = preview.replace("{COUNTER}", counter_str)
+
+        return Response({
+            "current_counter": config.current_counter,
+            "next_invoice_number": preview
+        })
+
+
+# =============================================================================
+# BILLING RULE VIEWS (Tab 1 - Rules List)
+# =============================================================================
+
+class BillingRuleViewSet(InheritableScopedViewSet):
+    """
+    ViewSet for billing rules.
+
+    Uses InheritableScopedViewSet for upward visibility:
+    - ENTITY scope sees ENTITY + COMPANY + ORG rules
+    - COMPANY scope sees COMPANY + ORG rules
+    - ORG scope sees ORG rules only
+
+    Endpoints:
+    - GET /billing-rules/ - List all rules (includes inherited from parent scopes)
+    - POST /billing-rules/ - Create rule
+    - GET /billing-rules/{id}/ - Get rule details
+    - PATCH /billing-rules/{id}/ - Update rule
+    - DELETE /billing-rules/{id}/ - Delete rule
+    - POST /billing-rules/{id}/activate/ - Activate rule
+    - POST /billing-rules/{id}/deactivate/ - Deactivate rule
+    - POST /billing-rules/{id}/clone/ - Clone rule
+    """
+
+    queryset = models.BillingRule.objects.all()
+    serializer_class = serializers.BillingRuleSerializer
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return serializers.BillingRuleListSerializer
+        if self.action == "retrieve":
+            return serializers.BillingRuleDetailSerializer
+        return serializers.BillingRuleSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        # Filter by category
+        category = self.request.query_params.get("category")
+        if category:
+            queryset = queryset.filter(category=category)
+
+        # Filter by applies_to
+        applies_to = self.request.query_params.get("applies_to")
+        if applies_to:
+            queryset = queryset.filter(applies_to=applies_to)
+
+        # Filter by status
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        return queryset.select_related("owner")
+
+    def perform_create(self, serializer):
+        scope = self.get_active_scope()
+        serializer.save(
+            scope=scope,
+            created_by=self.request.user,
+            owner=self.request.user
+        )
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        """Activate a billing rule."""
+        rule = self.get_object()
+        rule.status = models.BillingRule.RuleStatus.ACTIVE
+        rule.save()
+        serializer = self.get_serializer(rule)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        """Deactivate a billing rule."""
+        rule = self.get_object()
+        rule.status = models.BillingRule.RuleStatus.INACTIVE
+        rule.save()
+        serializer = self.get_serializer(rule)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def clone(self, request, pk=None):
+        """Clone a billing rule."""
+        original = self.get_object()
+        scope = self.get_active_scope()
+
+        # Create copy
+        cloned = models.BillingRule.objects.create(
+            scope=scope,
+            name=f"{original.name} (Copy)",
+            description=original.description,
+            category=original.category,
+            applies_to=original.applies_to,
+            status=models.BillingRule.RuleStatus.DRAFT,
+            rule_config=original.rule_config,
+            owner=request.user,
+            created_by=request.user
+        )
+
+        serializer = self.get_serializer(cloned)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+# =============================================================================
+# DISPUTE RULE VIEWS (Tab 5 - AR Rules)
+# =============================================================================
+
+class DisputeRuleViewSet(InheritableScopedViewSet):
+    """
+    ViewSet for dispute rules.
+
+    Uses InheritableScopedViewSet for upward visibility:
+    - Child scopes see rules from parent scopes
+
+    Endpoints:
+    - GET /dispute-rules/ - List all rules (includes inherited from parent scopes)
+    - POST /dispute-rules/ - Create rule
+    - GET /dispute-rules/{id}/ - Get rule details
+    - PATCH /dispute-rules/{id}/ - Update rule
+    - DELETE /dispute-rules/{id}/ - Delete rule
+    - POST /dispute-rules/{id}/activate/ - Activate rule
+    - POST /dispute-rules/{id}/deactivate/ - Deactivate rule
+    - POST /dispute-rules/reorder/ - Reorder priorities
+    """
+
+    queryset = models.DisputeRule.objects.all()
+    serializer_class = serializers.DisputeRuleSerializer
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return serializers.DisputeRuleListSerializer
+        if self.action == "retrieve":
+            return serializers.DisputeRuleDetailSerializer
+        return serializers.DisputeRuleSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        # Filter by status
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        # Filter by condition type
+        condition_type = self.request.query_params.get("condition_type")
+        if condition_type:
+            queryset = queryset.filter(condition_type=condition_type)
+
+        return queryset.select_related("route_to_user")
+
+    def perform_create(self, serializer):
+        scope = self.get_active_scope()
+        # Set priority to max + 1
+        max_priority = models.DisputeRule.objects.filter(scope=scope).aggregate(
+            max_p=models.models.Max("priority")
+        )["max_p"] or 0
+        serializer.save(
+            scope=scope,
+            created_by=self.request.user,
+            priority=max_priority + 1
+        )
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        """Activate a dispute rule."""
+        rule = self.get_object()
+        rule.status = models.DisputeRule.RuleStatus.ACTIVE
+        rule.save()
+        serializer = self.get_serializer(rule)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        """Deactivate a dispute rule."""
+        rule = self.get_object()
+        rule.status = models.DisputeRule.RuleStatus.INACTIVE
+        rule.save()
+        serializer = self.get_serializer(rule)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["post"])
+    def reorder(self, request):
+        """Reorder dispute rule priorities."""
+        scope = self.get_active_scope()
+        order = request.data.get("order", [])  # List of rule IDs in priority order
+
+        for idx, rule_id in enumerate(order, start=1):
+            models.DisputeRule.objects.filter(
+                id=rule_id, scope=scope
+            ).update(priority=idx)
+
+        rules = models.DisputeRule.objects.filter(scope=scope).order_by("priority")
+        serializer = serializers.DisputeRuleListSerializer(rules, many=True)
+        return Response(serializer.data)
+
+
+# =============================================================================
+# CREDIT RULE VIEWS (Tab 5 - AR Rules)
+# =============================================================================
+
+class CreditRuleViewSet(InheritableScopedViewSet):
+    """
+    ViewSet for credit rules.
+
+    Uses InheritableScopedViewSet for upward visibility:
+    - Child scopes see rules from parent scopes
+
+    Endpoints:
+    - GET /credit-rules/ - List all rules (includes inherited from parent scopes)
+    - POST /credit-rules/ - Create rule
+    - GET /credit-rules/{id}/ - Get rule details
+    - PATCH /credit-rules/{id}/ - Update rule
+    - DELETE /credit-rules/{id}/ - Delete rule
+    - POST /credit-rules/{id}/activate/ - Activate rule
+    - POST /credit-rules/{id}/deactivate/ - Deactivate rule
+    """
+
+    queryset = models.CreditRule.objects.all()
+    serializer_class = serializers.CreditRuleSerializer
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return serializers.CreditRuleListSerializer
+        if self.action == "retrieve":
+            return serializers.CreditRuleDetailSerializer
+        return serializers.CreditRuleSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        # Filter by status
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        # Filter by trigger type
+        trigger_type = self.request.query_params.get("trigger_type")
+        if trigger_type:
+            queryset = queryset.filter(trigger_type=trigger_type)
+
+        # Filter by approval level
+        approval_level = self.request.query_params.get("approval_level")
+        if approval_level:
+            queryset = queryset.filter(approval_level=approval_level)
+
+        return queryset
+
+    def perform_create(self, serializer):
+        scope = self.get_active_scope()
+        serializer.save(scope=scope, created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        """Activate a credit rule."""
+        rule = self.get_object()
+        rule.status = models.CreditRule.RuleStatus.ACTIVE
+        rule.save()
+        serializer = self.get_serializer(rule)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        """Deactivate a credit rule."""
+        rule = self.get_object()
+        rule.status = models.CreditRule.RuleStatus.INACTIVE
+        rule.save()
+        serializer = self.get_serializer(rule)
+        return Response(serializer.data)
+
+
+# =============================================================================
+# AR GLOBAL SETTINGS VIEWS (Tab 5 - Toggle Switches)
+# =============================================================================
+
+class ARGlobalSettingsViewSet(ScopedViewSet):
+    """
+    ViewSet for AR global settings (scope-level).
+
+    Endpoints:
+    - GET /ar-global-settings/ - Get settings for scope
+    - POST /ar-global-settings/ - Create settings
+    - PATCH /ar-global-settings/ - Update settings
+    """
+
+    queryset = models.ARGlobalSettings.objects.all()
+    serializer_class = serializers.ARGlobalSettingsSerializer
+
+    def get_serializer_class(self):
+        if self.action in ["update", "partial_update", "update_settings"]:
+            return serializers.ARGlobalSettingsUpdateSerializer
+        return serializers.ARGlobalSettingsSerializer
+
+    def list(self, request):
+        """Get AR settings for current scope (returns single object)."""
+        scope = self.get_active_scope()
+        try:
+            settings = models.ARGlobalSettings.objects.get(scope=scope)
+            serializer = self.get_serializer(settings)
+            return Response(serializer.data)
+        except models.ARGlobalSettings.DoesNotExist:
+            return Response(
+                {"detail": "AR settings not found. Use POST to create."},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+    def create(self, request):
+        """Create AR settings for scope."""
+        scope = self.get_active_scope()
+
+        if models.ARGlobalSettings.objects.filter(scope=scope).exists():
+            return Response(
+                {"error": "AR settings already exist for this scope. Use PATCH to update."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(scope=scope, created_by=request.user)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["patch"], url_path="update")
+    def update_settings(self, request):
+        """Update AR settings for scope."""
+        scope = self.get_active_scope()
+        settings, created = models.ARGlobalSettings.objects.get_or_create(
+            scope=scope,
+            defaults={"created_by": request.user}
+        )
+
+        serializer = serializers.ARGlobalSettingsUpdateSerializer(
+            settings, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save(updated_by=request.user)
+        return Response(serializer.data)
+
+
+# =============================================================================
+# BILLING CONFIGURATION BUNDLE VIEW
+# =============================================================================
+
+class BillingConfigBundleView(APIView):
+    """
+    Get all billing configuration for a scope in one request.
+
+    GET /api/billing/config/
+    Returns: ageing_config, ageing_buckets, ar_global_settings, dispute_rules, credit_rules, billing_rules
+    """
+
+    def get_active_scope(self):
+        """Get scope from request header."""
+        from apps.core.models import TenantScope
+        scope_id = self.request.headers.get("X-Tenant-Scope")
+        if not scope_id:
+            return None
+        try:
+            return TenantScope.objects.get(id=scope_id)
+        except TenantScope.DoesNotExist:
+            return None
+
+    def get(self, request):
+        scope = self.get_active_scope()
+        if not scope:
+            return Response(
+                {"error": "X-Tenant-Scope header required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Ageing config
+        ageing_config = None
+        try:
+            ageing_config = models.AgeingConfig.objects.get(scope=scope)
+        except models.AgeingConfig.DoesNotExist:
+            pass
+
+        # Ageing buckets
+        ageing_buckets = models.AgeingBucket.objects.filter(scope=scope)
+
+        # AR global settings
+        ar_settings = None
+        try:
+            ar_settings = models.ARGlobalSettings.objects.get(scope=scope)
+        except models.ARGlobalSettings.DoesNotExist:
+            pass
+
+        # Rules
+        dispute_rules = models.DisputeRule.objects.filter(scope=scope)
+        credit_rules = models.CreditRule.objects.filter(scope=scope)
+        billing_rules = models.BillingRule.objects.filter(scope=scope)
+
+        return Response({
+            "ageing_config": serializers.AgeingConfigSerializer(ageing_config).data if ageing_config else None,
+            "ageing_buckets": serializers.AgeingBucketListSerializer(ageing_buckets, many=True).data,
+            "ar_global_settings": serializers.ARGlobalSettingsSerializer(ar_settings).data if ar_settings else None,
+            "dispute_rules": serializers.DisputeRuleListSerializer(dispute_rules, many=True).data,
+            "credit_rules": serializers.CreditRuleListSerializer(credit_rules, many=True).data,
+            "billing_rules": serializers.BillingRuleListSerializer(billing_rules, many=True).data,
+        })
+
+
+class SiteBillingConfigBundleView(APIView):
+    """
+    Get all billing configuration for a specific site.
+
+    GET /api/billing/site/{site_id}/config/
+    Returns: site_billing_config + scope_config (ageing, ar_settings, rules)
+    """
+
+    def get_active_scope(self):
+        from apps.core.models import TenantScope
+        scope_id = self.request.headers.get("X-Tenant-Scope")
+        if not scope_id:
+            return None
+        try:
+            return TenantScope.objects.get(id=scope_id)
+        except TenantScope.DoesNotExist:
+            return None
+
+    def get(self, request, site_id):
+        scope = self.get_active_scope()
+        if not scope:
+            return Response(
+                {"error": "X-Tenant-Scope header required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Site billing config
+        try:
+            site_config = models.SiteBillingConfig.objects.select_related("site").get(
+                site_id=site_id, scope=scope
+            )
+        except models.SiteBillingConfig.DoesNotExist:
+            return Response(
+                {"error": "Billing config not found for this site"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Scope-level config
+        ageing_config = None
+        try:
+            ageing_config = models.AgeingConfig.objects.get(scope=scope)
+        except models.AgeingConfig.DoesNotExist:
+            pass
+
+        ar_settings = None
+        try:
+            ar_settings = models.ARGlobalSettings.objects.get(scope=scope)
+        except models.ARGlobalSettings.DoesNotExist:
+            pass
+
+        return Response({
+            "site_billing_config": serializers.SiteBillingConfigDetailSerializer(site_config).data,
+            "scope_config": {
+                "ageing_config": serializers.AgeingConfigSerializer(ageing_config).data if ageing_config else None,
+                "ageing_buckets": serializers.AgeingBucketListSerializer(
+                    models.AgeingBucket.objects.filter(scope=scope), many=True
+                ).data,
+                "ar_global_settings": serializers.ARGlobalSettingsSerializer(ar_settings).data if ar_settings else None,
+            }
+        })
+
+
+class AgeingBucketViewSet(InheritableScopedViewSet):
     """
     ViewSet for ageing bucket configuration.
 
+    Uses InheritableScopedViewSet for upward visibility:
+    - Child scopes see buckets from parent scopes
+
     Endpoints:
-    - GET /ageing-buckets/ - List all ageing buckets
+    - GET /ageing-buckets/ - List all ageing buckets (includes inherited from parent scopes)
     - POST /ageing-buckets/ - Create ageing bucket
     - GET /ageing-buckets/{id}/ - Get bucket details
     - PATCH /ageing-buckets/{id}/ - Update bucket

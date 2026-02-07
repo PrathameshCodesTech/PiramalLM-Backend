@@ -52,6 +52,46 @@ class TenantScopeSerializer(serializers.ModelSerializer):
     entity_name = serializers.CharField(source="entity.name", read_only=True)
     site_name = serializers.CharField(source="site.name", read_only=True)
 
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        org = attrs.get("org") or getattr(self.instance, "org", None)
+        company = attrs.get("company") or getattr(self.instance, "company", None)
+        entity = attrs.get("entity") or getattr(self.instance, "entity", None)
+        site = attrs.get("site") or getattr(self.instance, "site", None)
+        scope_type = attrs.get("scope_type") or getattr(self.instance, "scope_type", None)
+
+        refs = [bool(org), bool(company), bool(entity), bool(site)]
+        if sum(refs) != 1:
+            raise serializers.ValidationError(
+                "TenantScope must link to exactly one of org/company/entity/site."
+            )
+
+        # Ensure scope_type matches the linked ref
+        if org and scope_type != models.TenantScope.ScopeType.ORG:
+            raise serializers.ValidationError({"scope_type": "scope_type must be ORG when org is set."})
+        if company and scope_type != models.TenantScope.ScopeType.COMPANY:
+            raise serializers.ValidationError({"scope_type": "scope_type must be COMPANY when company is set."})
+        if entity and scope_type != models.TenantScope.ScopeType.ENTITY:
+            raise serializers.ValidationError({"scope_type": "scope_type must be ENTITY when entity is set."})
+        if site and scope_type != models.TenantScope.ScopeType.SITE:
+            raise serializers.ValidationError({"scope_type": "scope_type must be SITE when site is set."})
+
+        # Enforce 1:1 scope per ref with a clean 400 instead of DB IntegrityError
+        qs = models.TenantScope.objects.all()
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if org and qs.filter(org=org).exists():
+            raise serializers.ValidationError({"org": "A scope already exists for this org."})
+        if company and qs.filter(company=company).exists():
+            raise serializers.ValidationError({"company": "A scope already exists for this company."})
+        if entity and qs.filter(entity=entity).exists():
+            raise serializers.ValidationError({"entity": "A scope already exists for this entity."})
+        if site and qs.filter(site=site).exists():
+            raise serializers.ValidationError({"site": "A scope already exists for this site."})
+
+        return attrs
+
     class Meta:
         model = models.TenantScope
         fields = "__all__"
@@ -119,77 +159,13 @@ class ScopeMembershipSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at")
 
 
-# ===================== UserCredential Serializers =====================
-
-class UserCredentialSerializer(serializers.ModelSerializer):
-    user_username = serializers.CharField(source="user.username", read_only=True)
-    user_email = serializers.CharField(source="user.email", read_only=True)
-    scope_name = serializers.CharField(source="scope.name", read_only=True)
-
-    class Meta:
-        model = models.UserCredential
-        fields = ("id", "user", "user_username", "user_email", "scope", "scope_name", "password_plain", "created_at")
-        read_only_fields = ("id", "created_at")
-
-
 # ===================== UserProfile Serializers =====================
 
 class UserProfileSerializer(serializers.ModelSerializer):
-    active_scope_name = serializers.CharField(source="active_scope.name", read_only=True)
-    active_scope_type = serializers.CharField(source="active_scope.scope_type", read_only=True)
-
     class Meta:
         model = models.UserProfile
         fields = "__all__"
         read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at")
-
-
-# ===================== UserScope Serializers =====================
-
-class UserScopeSerializer(serializers.ModelSerializer):
-    scope_type = serializers.CharField(source="scope.scope_type", read_only=True)
-    scope_name = serializers.CharField(source="scope.name", read_only=True)
-    scope_code = serializers.CharField(source="scope.code", read_only=True)
-    user_email = serializers.CharField(source="user.email", read_only=True)
-    user_name = serializers.SerializerMethodField()
-
-    class Meta:
-        model = models.UserScope
-        fields = "__all__"
-        read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "deleted_at")
-
-    def get_user_name(self, obj):
-        if obj.user:
-            return obj.user.get_full_name() or obj.user.username
-        return None
-
-
-class UserScopeListSerializer(serializers.ModelSerializer):
-    """Lightweight serializer for list views."""
-    scope_type = serializers.CharField(source="scope.scope_type", read_only=True)
-    scope_name = serializers.CharField(source="scope.name", read_only=True)
-    scope_id = serializers.IntegerField(source="scope.id", read_only=True)
-
-    class Meta:
-        model = models.UserScope
-        fields = (
-            "id", "user", "scope_id", "scope_type", "scope_name",
-            "can_view", "can_create", "can_edit", "can_delete", "is_active"
-        )
-
-
-class UserScopeCreateSerializer(serializers.ModelSerializer):
-    """For creating user scopes."""
-    class Meta:
-        model = models.UserScope
-        fields = ("user", "scope", "can_view", "can_create", "can_edit", "can_delete")
-
-
-class UserScopeUpdateSerializer(serializers.ModelSerializer):
-    """For updating permissions on existing scope."""
-    class Meta:
-        model = models.UserScope
-        fields = ("can_view", "can_create", "can_edit", "can_delete", "is_active")
 
 
 # ===================== User Serializers =====================
@@ -209,41 +185,33 @@ class UserSerializer(serializers.ModelSerializer):
 
 
 class UserListSerializer(serializers.ModelSerializer):
-    """User list with scope counts."""
+    """User list with memberships count."""
     role = serializers.SerializerMethodField()
-    scopes_count = serializers.SerializerMethodField()
-    site_scopes_count = serializers.SerializerMethodField()
+    memberships_count = serializers.SerializerMethodField()
     full_name = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = (
             "id", "username", "email", "first_name", "last_name",
-            "is_active", "role", "scopes_count", "site_scopes_count", "full_name"
+            "is_active", "role", "memberships_count", "full_name"
         )
 
     def get_role(self, obj):
         profile = getattr(obj, "profile", None)
         return profile.role if profile else None
 
-    def get_scopes_count(self, obj):
-        return obj.user_scopes.filter(is_active=True).count()
-
-    def get_site_scopes_count(self, obj):
-        return obj.user_scopes.filter(
-            is_active=True,
-            scope__scope_type=models.TenantScope.ScopeType.SITE
-        ).count()
+    def get_memberships_count(self, obj):
+        return obj.scope_memberships.filter(is_active=True).count()
 
     def get_full_name(self, obj):
         return obj.get_full_name() or obj.username
 
 
 class UserDetailSerializer(serializers.ModelSerializer):
-    """Full user detail with profile and scopes."""
+    """Full user detail with profile and memberships."""
     role = serializers.SerializerMethodField()
     profile = serializers.SerializerMethodField()
-    scopes = serializers.SerializerMethodField()
     memberships = serializers.SerializerMethodField()
 
     class Meta:
@@ -251,7 +219,7 @@ class UserDetailSerializer(serializers.ModelSerializer):
         fields = (
             "id", "username", "email", "first_name", "last_name",
             "is_active", "is_staff", "is_superuser", "date_joined",
-            "role", "profile", "scopes", "memberships"
+            "role", "profile", "memberships"
         )
 
     def get_role(self, obj):
@@ -266,13 +234,8 @@ class UserDetailSerializer(serializers.ModelSerializer):
                 "role": profile.role,
                 "phone": profile.phone,
                 "profile_json": profile.profile_json,
-                "active_scope_id": profile.active_scope_id,
             }
         return None
-
-    def get_scopes(self, obj):
-        scopes = obj.user_scopes.filter(is_active=True).select_related("scope")
-        return UserScopeListSerializer(scopes, many=True).data
 
     def get_memberships(self, obj):
         memberships = obj.scope_memberships.filter(is_active=True).select_related("scope", "role")
@@ -290,7 +253,7 @@ class UserDetailSerializer(serializers.ModelSerializer):
 
 
 class UserCreateSerializer(serializers.ModelSerializer):
-    """For creating users with optional site assignment."""
+    """For creating users with optional ScopeMembership (Org/Company/Entity admin)."""
     password = serializers.CharField(write_only=True, min_length=6, required=False, allow_blank=True)
     role = serializers.ChoiceField(
         choices=models.UserProfile.UserRole.choices,
@@ -298,42 +261,34 @@ class UserCreateSerializer(serializers.ModelSerializer):
     )
     profile_json = serializers.JSONField(required=False, default=dict)
 
-    # Optional first site assignment
-    site_id = serializers.IntegerField(write_only=True, required=False)
-    can_view = serializers.BooleanField(write_only=True, default=True)
-    can_create = serializers.BooleanField(write_only=True, default=False)
-    can_edit = serializers.BooleanField(write_only=True, default=False)
-    can_delete = serializers.BooleanField(write_only=True, default=False)
+    scope_id = serializers.IntegerField(write_only=True, required=False)
+    role_id = serializers.IntegerField(write_only=True, required=False)
 
     class Meta:
         model = User
         fields = (
             "id", "username", "email", "first_name", "last_name", "password",
-            "role", "profile_json", "site_id", "can_view", "can_create", "can_edit", "can_delete"
+            "role", "profile_json",
+            "scope_id", "role_id",
         )
         read_only_fields = ("id",)
 
-
-# ===================== Assign Site Serializer =====================
-
-class AssignSiteSerializer(serializers.Serializer):
-    """For assigning a site to a user (create or update)."""
-    # User identification (either existing user_id or new user data)
-    user_id = serializers.IntegerField(required=False)
-    user = UserCreateSerializer(required=False)
-
-    # Site to assign
-    site_id = serializers.IntegerField(required=True)
-
-    # Permissions
-    can_view = serializers.BooleanField(default=True)
-    can_create = serializers.BooleanField(default=False)
-    can_edit = serializers.BooleanField(default=False)
-    can_delete = serializers.BooleanField(default=False)
-
     def validate(self, data):
-        if not data.get("user_id") and not data.get("user"):
-            raise serializers.ValidationError("Either user_id or user data must be provided.")
+        scope_id = data.get("scope_id")
+        role_id = data.get("role_id")
+        if scope_id and not role_id:
+            raise serializers.ValidationError({"role_id": "role_id is required when scope_id is provided."})
+        if role_id and not scope_id:
+            raise serializers.ValidationError({"scope_id": "scope_id is required when role_id is provided."})
+        if scope_id and role_id:
+            try:
+                scope = models.TenantScope.objects.get(id=scope_id, is_active=True)
+            except models.TenantScope.DoesNotExist:
+                raise serializers.ValidationError({"scope_id": "Invalid scope_id or scope is inactive."})
+            try:
+                role = models.Role.objects.get(id=role_id, scope=scope)
+            except models.Role.DoesNotExist:
+                raise serializers.ValidationError({"role_id": "Invalid role_id or role does not belong to this scope."})
         return data
 
 
@@ -356,6 +311,5 @@ class MembershipTreeSerializer(serializers.Serializer):
 class MeSerializer(serializers.Serializer):
     """Serializer for /me/ endpoint response."""
     user = serializers.DictField()
-    active_scope_id = serializers.IntegerField(allow_null=True)
     memberships = MembershipTreeSerializer(many=True)
     permissions = serializers.DictField(required=False)

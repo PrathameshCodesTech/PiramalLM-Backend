@@ -649,3 +649,378 @@ class SiteAttachment(TenantModel):
     def clean(self):
         if self.site_id and self.scope_id and self.site.scope_id != self.scope_id:
             raise ValidationError("SiteAttachment.scope must match Site.scope.")
+
+
+# =============================================================================
+# CAM COMPONENTS (Tab 3 - CAM Components)
+# =============================================================================
+
+class CAMComponentGroup(TenantModel):
+    """
+    Category groups for CAM components.
+    Scope-level configuration.
+
+    UI: CAM Components tab - Grouped sections (Core CAM, Security, Housekeeping, Utilities)
+    """
+
+    name = models.CharField(
+        max_length=100,
+        help_text="Group name e.g., 'Core CAM', 'Security', 'Housekeeping', 'Utilities'"
+    )
+    code = models.SlugField(
+        max_length=50,
+        help_text="Unique code for the group"
+    )
+    description = models.TextField(
+        blank=True,
+        help_text="Description of this component group"
+    )
+    sort_order = models.PositiveIntegerField(
+        default=0,
+        help_text="Display order of groups"
+    )
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        verbose_name = "CAM Component Group"
+        verbose_name_plural = "CAM Component Groups"
+        ordering = ["sort_order", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope", "code"],
+                name="unique_cam_group_code_per_scope"
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class CAMComponent(TenantModel):
+    """
+    Master definition of CAM components.
+    Scope-level configuration with default rates.
+
+    UI: CAM Components tab - Component list and detail form
+    """
+
+    class RateLogic(models.TextChoices):
+        PER_SQFT_MONTHLY = "PER_SQFT_MONTHLY", "Per Sq.Ft - Monthly"
+        PER_SQFT_ANNUAL = "PER_SQFT_ANNUAL", "Per Sq.Ft - Annual"
+        SHARE_OF_TOTAL = "SHARE_OF_TOTAL", "Share of Total"
+        FIXED_MONTHLY = "FIXED_MONTHLY", "Fixed Monthly"
+        FIXED_ANNUAL = "FIXED_ANNUAL", "Fixed Annual"
+        PER_UNIT = "PER_UNIT", "Per Unit"
+
+    class AreaBasis(models.TextChoices):
+        CHARGEABLE_AREA = "CHARGEABLE_AREA", "Chargeable Area"
+        CARPET_AREA = "CARPET_AREA", "Carpet Area"
+        SUPER_BUILTUP = "SUPER_BUILTUP", "Super Builtup Area"
+        LEASABLE_AREA = "LEASABLE_AREA", "Leasable Area"
+
+    class RateType(models.TextChoices):
+        FIXED = "FIXED", "Fixed"
+        INDEX_LINKED = "INDEX_LINKED", "Index-linked"
+
+    class UtilitiesTreatment(models.TextChoices):
+        INCLUDED = "INCLUDED", "Included"
+        METERED = "METERED", "Metered"
+        BLENDED = "BLENDED", "Blended"
+
+    # Basic Info
+    group = models.ForeignKey(
+        CAMComponentGroup,
+        on_delete=models.PROTECT,
+        related_name="components",
+        help_text="Category group for this component"
+    )
+    name = models.CharField(
+        max_length=100,
+        help_text="Component name e.g., 'HVAC Maintenance', 'Security Personnel'"
+    )
+    code = models.SlugField(
+        max_length=50,
+        help_text="Unique code for the component"
+    )
+    description = models.TextField(
+        blank=True,
+        help_text="Detailed description of the component"
+    )
+
+    # Rate & Basis
+    rate_logic = models.CharField(
+        max_length=20,
+        choices=RateLogic.choices,
+        default=RateLogic.PER_SQFT_MONTHLY,
+        help_text="How the rate is calculated"
+    )
+    default_rate = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+        help_text="Default rate value"
+    )
+    area_basis = models.CharField(
+        max_length=20,
+        choices=AreaBasis.choices,
+        default=AreaBasis.CHARGEABLE_AREA,
+        help_text="Which area measurement to use"
+    )
+    rate_type = models.CharField(
+        max_length=20,
+        choices=RateType.choices,
+        default=RateType.FIXED,
+        help_text="Whether rate is fixed or index-linked"
+    )
+    rate_unit = models.CharField(
+        max_length=50,
+        default="sq. ft. / month",
+        help_text="Unit of measurement for display"
+    )
+
+    # Tax
+    gst_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=18.00,
+        help_text="GST rate percentage"
+    )
+
+    # Index-linked specific
+    index_name = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Index name for INDEX_LINKED rate type"
+    )
+
+    # Utilities Treatment
+    utilities_treatment = models.CharField(
+        max_length=20,
+        choices=UtilitiesTreatment.choices,
+        default=UtilitiesTreatment.INCLUDED,
+        help_text="How utility charges related to this component are handled"
+    )
+
+    # Applicability Flags
+    fit_out_applicable = models.BooleanField(
+        default=True,
+        help_text="Whether this component applies during fit-out period"
+    )
+    post_handover_applicable = models.BooleanField(
+        default=True,
+        help_text="Whether this component applies post-handover"
+    )
+
+    # Template Flags
+    follow_cam_template = models.BooleanField(
+        default=False,
+        help_text="Follow CAM template for escalation"
+    )
+    follow_parking_template = models.BooleanField(
+        default=False,
+        help_text="Follow parking template for escalation"
+    )
+
+    # GL Mapping
+    gl_code = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="GL code for this component"
+    )
+
+    # Status
+    is_active = models.BooleanField(default=True)
+
+    # Notes
+    notes = models.TextField(
+        blank=True,
+        help_text="Additional notes"
+    )
+
+    class Meta:
+        verbose_name = "CAM Component"
+        verbose_name_plural = "CAM Components"
+        ordering = ["group__sort_order", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope", "code"],
+                name="unique_cam_component_code_per_scope"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.group.name} - {self.name}"
+
+    def clean(self):
+        super().clean()
+        if self.group_id and self.scope_id and self.group.scope_id != self.scope_id:
+            raise ValidationError("CAMComponent scope must match CAMComponentGroup scope.")
+
+    def calculate_charge(self, area_sqft, consumption_kwh=None, consumption_liters=None):
+        """
+        Calculate the charge for this component based on area and consumption.
+
+        Args:
+            area_sqft: Area in square feet
+            consumption_kwh: Electricity consumption in kWh (for metered utilities)
+            consumption_liters: Water consumption in liters (for metered utilities)
+
+        Returns:
+            Tuple of (base_charge, gst_amount, total_charge)
+        """
+        from decimal import Decimal
+
+        base_charge = Decimal("0")
+
+        if self.rate_logic == self.RateLogic.PER_SQFT_MONTHLY:
+            base_charge = Decimal(str(area_sqft)) * self.default_rate
+        elif self.rate_logic == self.RateLogic.PER_SQFT_ANNUAL:
+            base_charge = Decimal(str(area_sqft)) * self.default_rate / 12
+        elif self.rate_logic == self.RateLogic.FIXED_MONTHLY:
+            base_charge = self.default_rate
+        elif self.rate_logic == self.RateLogic.FIXED_ANNUAL:
+            base_charge = self.default_rate / 12
+        elif self.rate_logic == self.RateLogic.SHARE_OF_TOTAL:
+            # Requires total pool calculation - handled at site level
+            base_charge = self.default_rate
+
+        gst_amount = base_charge * (self.gst_rate / 100)
+        total_charge = base_charge + gst_amount
+
+        return (base_charge, gst_amount, total_charge)
+
+
+class SiteCAMConfig(TenantModel):
+    """
+    Site-specific CAM component configuration.
+    Allows overriding default rates and settings per site.
+
+    UI: CAM Components tab - Property-specific configuration
+    """
+
+    site = models.ForeignKey(
+        Site,
+        on_delete=models.CASCADE,
+        related_name="cam_configs"
+    )
+    component = models.ForeignKey(
+        CAMComponent,
+        on_delete=models.CASCADE,
+        related_name="site_configs"
+    )
+
+    # Override values (null = use component defaults)
+    override_rate = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Override rate for this site (null = use component default)"
+    )
+    override_area_basis = models.CharField(
+        max_length=20,
+        choices=CAMComponent.AreaBasis.choices,
+        blank=True,
+        help_text="Override area basis for this site"
+    )
+    override_gst_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Override GST rate for this site"
+    )
+
+    # Applicability overrides
+    fit_out_applicable = models.BooleanField(
+        default=True,
+        help_text="Whether this component applies during fit-out at this site"
+    )
+    post_handover_applicable = models.BooleanField(
+        default=True,
+        help_text="Whether this component applies post-handover at this site"
+    )
+
+    # Status
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Whether this component is active for this site"
+    )
+
+    # Site-specific GL override
+    gl_code_override = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Site-specific GL code override"
+    )
+
+    class Meta:
+        verbose_name = "Site CAM Configuration"
+        verbose_name_plural = "Site CAM Configurations"
+        ordering = ["site", "component__group__sort_order", "component__name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["site", "component"],
+                name="unique_site_cam_component"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.site.name} - {self.component.name}"
+
+    def clean(self):
+        super().clean()
+        if self.site_id and self.scope_id and self.site.scope_id != self.scope_id:
+            raise ValidationError("SiteCAMConfig scope must match Site scope.")
+        if self.component_id and self.scope_id and self.component.scope_id != self.scope_id:
+            raise ValidationError("SiteCAMConfig scope must match CAMComponent scope.")
+
+    def get_effective_rate(self):
+        """Get the effective rate (override or default)."""
+        if self.override_rate is not None:
+            return self.override_rate
+        return self.component.default_rate
+
+    def get_effective_area_basis(self):
+        """Get the effective area basis (override or default)."""
+        if self.override_area_basis:
+            return self.override_area_basis
+        return self.component.area_basis
+
+    def get_effective_gst_rate(self):
+        """Get the effective GST rate (override or default)."""
+        if self.override_gst_rate is not None:
+            return self.override_gst_rate
+        return self.component.gst_rate
+
+    def get_effective_gl_code(self):
+        """Get the effective GL code (override or default)."""
+        if self.gl_code_override:
+            return self.gl_code_override
+        return self.component.gl_code
+
+    def calculate_charge(self, area_sqft, consumption_kwh=None, consumption_liters=None):
+        """
+        Calculate the charge using site-specific rates.
+        """
+        from decimal import Decimal
+
+        rate = self.get_effective_rate()
+        gst_rate = self.get_effective_gst_rate()
+        base_charge = Decimal("0")
+
+        if self.component.rate_logic == CAMComponent.RateLogic.PER_SQFT_MONTHLY:
+            base_charge = Decimal(str(area_sqft)) * rate
+        elif self.component.rate_logic == CAMComponent.RateLogic.PER_SQFT_ANNUAL:
+            base_charge = Decimal(str(area_sqft)) * rate / 12
+        elif self.component.rate_logic == CAMComponent.RateLogic.FIXED_MONTHLY:
+            base_charge = rate
+        elif self.component.rate_logic == CAMComponent.RateLogic.FIXED_ANNUAL:
+            base_charge = rate / 12
+        elif self.component.rate_logic == CAMComponent.RateLogic.SHARE_OF_TOTAL:
+            base_charge = rate
+
+        gst_amount = base_charge * (gst_rate / 100)
+        total_charge = base_charge + gst_amount
+
+        return (base_charge, gst_amount, total_charge)

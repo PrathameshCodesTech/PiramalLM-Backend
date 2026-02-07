@@ -71,6 +71,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'apps.core.middleware.RequestContextResponseMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -157,6 +158,8 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
     ),
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 20,
 }
 
 CORS_ALLOW_HEADERS = list(default_headers) + [
@@ -177,4 +180,14 @@ CORS_ALLOWED_ORIGINS = [
 
 CORS_ALLOW_HEADERS = list(default_headers) + [
     "x-scope-id",
+]
+
+# Expose request-context headers so frontend can read them
+CORS_EXPOSE_HEADERS = [
+    "X-Request-User-Id",
+    "X-Request-Scope-Id",
+    "X-Request-Scope-Name",
+    "X-Request-Scope-Type",
+    "X-Request-Role",
+    "X-Request-Permissions",
 ]

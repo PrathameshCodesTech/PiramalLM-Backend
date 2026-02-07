@@ -2,6 +2,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.filters import SearchFilter, OrderingFilter
 
 from apps.core.utils import get_active_scope
 from apps.core.viewsets import ScopedViewSet
@@ -30,6 +31,27 @@ class SiteViewSet(SiteFullTreeMixin, ScopedViewSet):
     """
     queryset = models.Site.objects.all()
     serializer_class = serializers.SiteSerializer
+    filter_backends = [SearchFilter, OrderingFilter]
+    search_fields = ["name", "code", "city", "state"]
+    ordering_fields = ["name", "created_at"]
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        params = self.request.query_params
+
+        site_type = params.get("site_type")
+        state = params.get("state")
+        city = params.get("city")
+
+        if site_type:
+            queryset = queryset.filter(site_type__iexact=site_type)
+        if state:
+            queryset = queryset.filter(state__iexact=state)
+        if city:
+            queryset = queryset.filter(city__iexact=city)
+
+        return queryset
 
 
 class SiteAmenityViewSet(ScopedViewSet):
@@ -55,7 +77,7 @@ class SiteAmenityViewSet(ScopedViewSet):
 
 
 class TowerViewSet(ScopedViewSet):
-    queryset = models.Tower.objects.all()
+    queryset = models.Tower.objects.all().order_by("id")
     serializer_class = serializers.TowerSerializer
 
 

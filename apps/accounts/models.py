@@ -75,6 +75,27 @@ class TenantScope(AuditModel):
                 name="ck_scope_exactly_one_ref",
             ),
             models.UniqueConstraint(fields=["scope_type", "code"], name="uq_scope_type_code"),
+            # 1:1 constraints - ensure one TenantScope per Org/Company/Entity/Site
+            models.UniqueConstraint(
+                fields=["org"],
+                condition=Q(org__isnull=False),
+                name="uq_scope_one_per_org"
+            ),
+            models.UniqueConstraint(
+                fields=["company"],
+                condition=Q(company__isnull=False),
+                name="uq_scope_one_per_company"
+            ),
+            models.UniqueConstraint(
+                fields=["entity"],
+                condition=Q(entity__isnull=False),
+                name="uq_scope_one_per_entity"
+            ),
+            models.UniqueConstraint(
+                fields=["site"],
+                condition=Q(site__isnull=False),
+                name="uq_scope_one_per_site"
+            ),
         ]
 
     def clean(self):
@@ -117,6 +138,90 @@ class TenantScope(AuditModel):
             }
         return {}
 
+    def get_child_scopes(self):
+        """
+        Returns all child scopes (including self) based on hierarchy.
+        ORG → returns self + all COMPANY scopes + all ENTITY scopes under those companies
+        COMPANY → returns self + all ENTITY scopes under this company
+        ENTITY → returns self only
+        SITE → returns self only
+        """
+        scope_ids = [self.id]
+
+        if self.scope_type == self.ScopeType.ORG and self.org:
+            # Get all companies under this org
+            company_ids = list(Company.objects.filter(org=self.org).values_list("id", flat=True))
+            # Get company scopes
+            company_scope_ids = list(
+                TenantScope.objects.filter(
+                    company_id__in=company_ids,
+                    scope_type=self.ScopeType.COMPANY
+                ).values_list("id", flat=True)
+            )
+            scope_ids.extend(company_scope_ids)
+
+            # Get all entities under those companies
+            entity_ids = list(Entity.objects.filter(company_id__in=company_ids).values_list("id", flat=True))
+            # Get entity scopes
+            entity_scope_ids = list(
+                TenantScope.objects.filter(
+                    entity_id__in=entity_ids,
+                    scope_type=self.ScopeType.ENTITY
+                ).values_list("id", flat=True)
+            )
+            scope_ids.extend(entity_scope_ids)
+
+        elif self.scope_type == self.ScopeType.COMPANY and self.company:
+            # Get all entities under this company
+            entity_ids = list(Entity.objects.filter(company=self.company).values_list("id", flat=True))
+            # Get entity scopes
+            entity_scope_ids = list(
+                TenantScope.objects.filter(
+                    entity_id__in=entity_ids,
+                    scope_type=self.ScopeType.ENTITY
+                ).values_list("id", flat=True)
+            )
+            scope_ids.extend(entity_scope_ids)
+
+        return TenantScope.objects.filter(id__in=scope_ids)
+
+    @classmethod
+    def get_available_scopes_for_user(cls, user):
+        """
+        Returns all scopes a user can access (for scope picker dropdown).
+        Based on user's highest-level membership, returns that scope + all children.
+        """
+        from apps.accounts.models import ScopeMembership
+
+        # Get all active memberships for user
+        memberships = ScopeMembership.objects.filter(
+            user=user,
+            is_active=True
+        ).select_related("scope")
+
+        if not memberships.exists():
+            return cls.objects.none()
+
+        # Find the highest level scope (ORG > COMPANY > ENTITY > SITE)
+        level_order = {
+            cls.ScopeType.ORG: 1,
+            cls.ScopeType.COMPANY: 2,
+            cls.ScopeType.ENTITY: 3,
+            cls.ScopeType.SITE: 4,
+        }
+
+        # Sort by level and get highest (lowest number = highest level)
+        sorted_memberships = sorted(
+            memberships,
+            key=lambda m: level_order.get(m.scope.scope_type, 99)
+        )
+
+        # Get the highest level scope
+        highest_scope = sorted_memberships[0].scope
+
+        # Return this scope + all its children
+        return highest_scope.get_child_scopes()
+
 
 class ScopeMembership(AuditModel):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="scope_memberships")
@@ -142,13 +247,6 @@ class UserProfile(AuditModel):
         VIEWER = "VIEWER", "Viewer"
 
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile")
-    active_scope = models.ForeignKey(
-        TenantScope,
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="active_users",
-    )
     role = models.CharField(
         max_length=20,
         choices=UserRole.choices,
@@ -192,20 +290,6 @@ class Role(AuditModel):
         return f"{self.scope_id}:{self.code}"
 
 
-class UserCredential(AuditModel):
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="credentials")
-    scope = models.ForeignKey(TenantScope, on_delete=models.CASCADE, related_name="user_credentials")
-    password_plain = models.CharField(max_length=256)
-
-    class Meta:
-        indexes = [
-            models.Index(fields=["scope", "user"]),
-        ]
-
-    def __str__(self):
-        return f"{self.user_id} / {self.scope_id}"
-
-
 class RolePermission(AuditModel):
     role = models.ForeignKey(Role, on_delete=models.CASCADE, related_name="role_permissions")
     permission = models.ForeignKey(Permission, on_delete=models.CASCADE, related_name="permission_roles")
@@ -216,72 +300,3 @@ class RolePermission(AuditModel):
         ]
 
 
-class UserScope(AuditModel):
-    """
-    Granular user permissions at scope level (ORG, COMPANY, ENTITY, or SITE).
-    This allows assigning users to specific scopes with fine-grained permissions.
-    """
-
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="user_scopes"
-    )
-    scope = models.ForeignKey(
-        TenantScope,
-        on_delete=models.CASCADE,
-        related_name="user_scopes"
-    )
-
-    # Granular permissions
-    can_view = models.BooleanField(default=True)
-    can_create = models.BooleanField(default=False)
-    can_edit = models.BooleanField(default=False)
-    can_delete = models.BooleanField(default=False)
-
-    # Status
-    is_active = models.BooleanField(default=True, db_index=True)
-
-    class Meta:
-        verbose_name = "User Scope"
-        verbose_name_plural = "User Scopes"
-        constraints = [
-            models.UniqueConstraint(
-                fields=["user", "scope"],
-                name="uq_user_scope"
-            ),
-        ]
-        indexes = [
-            models.Index(fields=["user", "is_active"]),
-            models.Index(fields=["scope", "is_active"]),
-        ]
-
-    def __str__(self):
-        perms = []
-        if self.can_view:
-            perms.append("V")
-        if self.can_create:
-            perms.append("C")
-        if self.can_edit:
-            perms.append("E")
-        if self.can_delete:
-            perms.append("D")
-        return f"{self.user} -> {self.scope.name} [{'/'.join(perms)}]"
-
-    @property
-    def scope_type(self):
-        return self.scope.scope_type if self.scope else None
-
-    @property
-    def scope_name(self):
-        return self.scope.name if self.scope else None
-
-    def has_permission(self, action):
-        """Check if user has specific permission."""
-        action_map = {
-            "view": self.can_view,
-            "create": self.can_create,
-            "edit": self.can_edit,
-            "delete": self.can_delete,
-        }
-        return self.is_active and action_map.get(action, False)

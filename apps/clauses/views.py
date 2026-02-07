@@ -4,16 +4,19 @@ from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.db.models import Count, Q
 
-from apps.core.viewsets import ScopedViewSet
+from apps.core.viewsets import ScopedViewSet, InheritableScopedViewSet
 from . import models, serializers
 
 
-class ClauseCategoryViewSet(ScopedViewSet):
+class ClauseCategoryViewSet(InheritableScopedViewSet):
     """
     ViewSet for clause categories.
 
+    Uses InheritableScopedViewSet for upward visibility:
+    - Child scopes see categories from parent scopes
+
     Endpoints:
-    - GET /categories/ - List all categories
+    - GET /categories/ - List all categories (includes inherited from parent scopes)
     - POST /categories/ - Create category
     - GET /categories/{id}/ - Get category details
     - PATCH /categories/{id}/ - Update category
@@ -62,12 +65,15 @@ class ClauseCategoryViewSet(ScopedViewSet):
         return Response(serializer.data)
 
 
-class ClauseViewSet(ScopedViewSet):
+class ClauseViewSet(InheritableScopedViewSet):
     """
     ViewSet for clauses.
 
+    Uses InheritableScopedViewSet for upward visibility:
+    - Child scopes see clauses from parent scopes
+
     Endpoints:
-    - GET / - List all clauses
+    - GET / - List all clauses (includes inherited from parent scopes)
     - POST / - Create clause with initial version
     - GET /{id}/ - Get clause details
     - PATCH /{id}/ - Update clause
@@ -257,12 +263,15 @@ class ClauseViewSet(ScopedViewSet):
         )
 
 
-class ClauseVersionViewSet(ScopedViewSet):
+class ClauseVersionViewSet(InheritableScopedViewSet):
     """
     ViewSet for clause versions (read-only, creation via clause.bump).
 
+    Uses InheritableScopedViewSet for upward visibility:
+    - Child scopes see versions from parent scopes
+
     Endpoints:
-    - GET /versions/ - List all versions (filtered by clause_id param)
+    - GET /versions/ - List all versions (includes inherited from parent scopes)
     - GET /versions/{id}/ - Get version details
     """
 
@@ -291,12 +300,15 @@ class ClauseVersionViewSet(ScopedViewSet):
         return queryset.select_related("clause", "created_by")
 
 
-class ClauseDocumentViewSet(ScopedViewSet):
+class ClauseDocumentViewSet(InheritableScopedViewSet):
     """
     ViewSet for clause documents.
 
+    Uses InheritableScopedViewSet for upward visibility:
+    - Child scopes see documents from parent scopes
+
     Endpoints:
-    - GET /documents/ - List all documents
+    - GET /documents/ - List all documents (includes inherited from parent scopes)
     - POST /documents/ - Upload document
     - GET /documents/{id}/ - Get document details
     - PATCH /documents/{id}/ - Update document metadata
@@ -341,12 +353,15 @@ class ClauseDocumentViewSet(ScopedViewSet):
         serializer.save(updated_by=self.request.user)
 
 
-class ClauseDocumentLinkViewSet(ScopedViewSet):
+class ClauseDocumentLinkViewSet(InheritableScopedViewSet):
     """
     ViewSet for document-clause links.
 
+    Uses InheritableScopedViewSet for upward visibility:
+    - Child scopes see links from parent scopes
+
     Endpoints:
-    - GET /document-links/ - List all links
+    - GET /document-links/ - List all links (includes inherited from parent scopes)
     - POST /document-links/ - Create link
     - DELETE /document-links/{id}/ - Delete link
     """
@@ -464,12 +479,14 @@ class ClauseUsageViewSet(ScopedViewSet):
         return Response(serializer.data)
 
 
-class ClauseLibraryStatsViewSet(ScopedViewSet):
+class ClauseLibraryStatsViewSet(InheritableScopedViewSet):
     """
     ViewSet for clause library statistics.
 
+    Uses InheritableScopedViewSet to include inherited clauses in stats.
+
     Endpoints:
-    - GET /stats/summary/ - Get overall stats
+    - GET /stats/summary/ - Get overall stats (includes inherited from parent scopes)
     - GET /stats/by-category/ - Get stats by category
     """
 
@@ -478,23 +495,24 @@ class ClauseLibraryStatsViewSet(ScopedViewSet):
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
-        """Get overall clause library statistics."""
+        """Get overall clause library statistics (includes inherited from parent scopes)."""
         scope = self.get_active_scope()
+        scope_filter = self.get_inheritable_scope_filter(scope)
 
-        total_clauses = models.Clause.objects.filter(scope=scope).count()
+        total_clauses = models.Clause.objects.filter(scope_filter).count()
         active_clauses = models.Clause.objects.filter(
-            scope=scope, status=models.Clause.Status.ACTIVE
+            scope_filter, status=models.Clause.Status.ACTIVE
         ).count()
         draft_clauses = models.Clause.objects.filter(
-            scope=scope, status=models.Clause.Status.DRAFT
+            scope_filter, status=models.Clause.Status.DRAFT
         ).count()
         archived_clauses = models.Clause.objects.filter(
-            scope=scope, status=models.Clause.Status.ARCHIVED
+            scope_filter, status=models.Clause.Status.ARCHIVED
         ).count()
 
-        total_documents = models.ClauseDocument.objects.filter(scope=scope).count()
-        total_categories = models.ClauseCategory.objects.filter(scope=scope).count()
-        total_versions = models.ClauseVersion.objects.filter(scope=scope).count()
+        total_documents = models.ClauseDocument.objects.filter(scope_filter).count()
+        total_categories = models.ClauseCategory.objects.filter(scope_filter).count()
+        total_versions = models.ClauseVersion.objects.filter(scope_filter).count()
 
         return Response({
             "total_clauses": total_clauses,
@@ -508,11 +526,12 @@ class ClauseLibraryStatsViewSet(ScopedViewSet):
 
     @action(detail=False, methods=["get"], url_path="by-category")
     def by_category(self, request):
-        """Get clause counts by category."""
+        """Get clause counts by category (includes inherited from parent scopes)."""
         scope = self.get_active_scope()
+        scope_filter = self.get_inheritable_scope_filter(scope)
 
         categories = models.ClauseCategory.objects.filter(
-            scope=scope
+            scope_filter
         ).annotate(
             clause_count=Count("clauses"),
             active_count=Count(

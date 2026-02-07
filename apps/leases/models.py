@@ -1,8 +1,227 @@
 from django.db import models
+from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import MinValueValidator
+from django.core.validators import MinValueValidator, MaxValueValidator
 from decimal import Decimal
 from apps.core.models import TenantModel
+
+
+# =============================================================================
+# ESCALATION TEMPLATE (Tab 2 - Rent Escalation Templates)
+# =============================================================================
+
+class EscalationTemplate(TenantModel):
+    """
+    Reusable rent escalation templates that can be applied to leases.
+    Scope-level configuration.
+
+    UI: Rent Escalation Templates tab
+    """
+
+    class EscalationType(models.TextChoices):
+        FIXED_PERCENT = "FIXED_PERCENT", "Fixed %"
+        INDEX_LINKED = "INDEX_LINKED", "Index-linked"
+        STEP_WISE = "STEP_WISE", "Step-wise"
+
+    class Frequency(models.TextChoices):
+        ANNUAL = "ANNUAL", "Annual"
+        EVERY_2_YEARS = "EVERY_2_YEARS", "Every 2 Years"
+        EVERY_3_YEARS = "EVERY_3_YEARS", "Every 3 Years"
+        EVERY_5_YEARS = "EVERY_5_YEARS", "Every 5 Years"
+
+    class RoundingRule(models.TextChoices):
+        NEAREST_UNIT = "NEAREST_UNIT", "Nearest Unit"
+        NEAREST_TEN = "NEAREST_TEN", "Nearest Ten"
+        NEAREST_HUNDRED = "NEAREST_HUNDRED", "Nearest Hundred"
+        NEAREST_DOLLAR = "NEAREST_DOLLAR", "Nearest Dollar"
+        NO_ROUNDING = "NO_ROUNDING", "No Rounding"
+
+    class ApplicabilityType(models.TextChoices):
+        COMMERCIAL_OFFICE = "COMMERCIAL_OFFICE", "Commercial, Office"
+        RESIDENTIAL_APARTMENTS = "RESIDENTIAL_APARTMENTS", "Residential, Apartments"
+        RETAIL_SHOPPING_MALL = "RETAIL_SHOPPING_MALL", "Retail, Shopping Mall"
+        INDUSTRIAL_WAREHOUSE = "INDUSTRIAL_WAREHOUSE", "Industrial, Warehouse"
+        MIXED_USE = "MIXED_USE", "Mixed Use"
+        ALL = "ALL", "All Types"
+
+    class TemplateStatus(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        DRAFT = "DRAFT", "Draft"
+        ARCHIVED = "ARCHIVED", "Archived"
+
+    # Basic Info
+    name = models.CharField(
+        max_length=100,
+        help_text="Template name e.g., 'Annual CPI-linked Commercial'"
+    )
+    description = models.TextField(
+        blank=True,
+        help_text="Description of the template"
+    )
+
+    # Applicability
+    applicability = models.CharField(
+        max_length=30,
+        choices=ApplicabilityType.choices,
+        default=ApplicabilityType.ALL,
+        help_text="Which property/unit types this template applies to"
+    )
+
+    # Escalation Configuration
+    escalation_type = models.CharField(
+        max_length=20,
+        choices=EscalationType.choices,
+        default=EscalationType.FIXED_PERCENT
+    )
+    escalation_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Escalation percentage for FIXED_PERCENT type"
+    )
+    index_name = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Index name for INDEX_LINKED type e.g., 'CPI', 'WPI'"
+    )
+    index_base_value = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Base index value for INDEX_LINKED type"
+    )
+
+    # Step-wise escalation (stored as JSON)
+    step_schedule = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Step-wise escalation schedule"
+    )
+    # Structure:
+    # [
+    #     {"year": 1, "percentage": 0},
+    #     {"year": 2, "percentage": 3},
+    #     {"year": 3, "percentage": 5},
+    #     {"year": 4, "percentage": 7},
+    #     {"year": 5, "percentage": 10}
+    # ]
+
+    # Frequency & Timing
+    frequency = models.CharField(
+        max_length=20,
+        choices=Frequency.choices,
+        default=Frequency.ANNUAL
+    )
+    first_escalation_logic = models.CharField(
+        max_length=100,
+        default="After 12 months from rent start",
+        help_text="When first escalation occurs e.g., 'After 12 months from rent start'"
+    )
+    first_escalation_months = models.PositiveIntegerField(
+        default=12,
+        help_text="Months after rent start for first escalation"
+    )
+
+    # Rounding
+    rounding_rule = models.CharField(
+        max_length=20,
+        choices=RoundingRule.choices,
+        default=RoundingRule.NEAREST_DOLLAR
+    )
+
+    # Cap & Floor
+    cap_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Maximum escalation cap percentage"
+    )
+    floor_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Minimum escalation floor percentage"
+    )
+
+    # Apply to Other Charges
+    apply_to_cam = models.BooleanField(
+        default=False,
+        help_text="Apply escalation to CAM charges"
+    )
+    apply_to_parking = models.BooleanField(
+        default=False,
+        help_text="Apply escalation to Parking charges"
+    )
+
+    # Status
+    status = models.CharField(
+        max_length=20,
+        choices=TemplateStatus.choices,
+        default=TemplateStatus.DRAFT
+    )
+
+    class Meta:
+        verbose_name = "Escalation Template"
+        verbose_name_plural = "Escalation Templates"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope", "name"],
+                name="unique_escalation_template_name_per_scope"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.get_escalation_type_display()})"
+
+    def calculate_escalated_rent(self, base_rent, years_elapsed):
+        """
+        Calculate escalated rent based on template configuration.
+
+        Args:
+            base_rent: Original rent amount
+            years_elapsed: Number of years since rent start
+
+        Returns:
+            Escalated rent amount
+        """
+        if years_elapsed < (self.first_escalation_months / 12):
+            return base_rent
+
+        escalation_periods = 0
+        if self.frequency == self.Frequency.ANNUAL:
+            escalation_periods = int(years_elapsed - (self.first_escalation_months / 12)) + 1
+        elif self.frequency == self.Frequency.EVERY_2_YEARS:
+            escalation_periods = int((years_elapsed - (self.first_escalation_months / 12)) / 2) + 1
+        elif self.frequency == self.Frequency.EVERY_3_YEARS:
+            escalation_periods = int((years_elapsed - (self.first_escalation_months / 12)) / 3) + 1
+        elif self.frequency == self.Frequency.EVERY_5_YEARS:
+            escalation_periods = int((years_elapsed - (self.first_escalation_months / 12)) / 5) + 1
+
+        if self.escalation_type == self.EscalationType.FIXED_PERCENT:
+            if self.escalation_percentage:
+                multiplier = (1 + self.escalation_percentage / 100) ** escalation_periods
+                return base_rent * multiplier
+
+        elif self.escalation_type == self.EscalationType.STEP_WISE:
+            if self.step_schedule:
+                year = int(years_elapsed) + 1
+                for step in self.step_schedule:
+                    if step.get("year") == year:
+                        return base_rent * (1 + Decimal(str(step.get("percentage", 0))) / 100)
+                # Return last step if year exceeds schedule
+                if self.step_schedule:
+                    last_step = self.step_schedule[-1]
+                    return base_rent * (1 + Decimal(str(last_step.get("percentage", 0))) / 100)
+
+        return base_rent
 
 
 class Agreement(TenantModel):
@@ -232,7 +451,8 @@ class LeaseFinancials(TenantModel):
 
 class LeaseEscalation(TenantModel):
     """
-    Rent escalation terms.
+    Rent escalation terms for a lease agreement.
+    Can use a template or custom configuration.
     """
 
     class EscalationType(models.TextChoices):
@@ -248,6 +468,21 @@ class LeaseEscalation(TenantModel):
         related_name="escalation"
     )
 
+    # Template Reference (optional)
+    template = models.ForeignKey(
+        EscalationTemplate,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="lease_escalations",
+        help_text="Optional: Use an escalation template"
+    )
+    use_template_values = models.BooleanField(
+        default=False,
+        help_text="If true and template is set, inherit all values from template"
+    )
+
+    # Custom/Override Configuration
     escalation_type = models.CharField(
         max_length=20,
         choices=EscalationType.choices,
@@ -262,9 +497,56 @@ class LeaseEscalation(TenantModel):
         default=12,
         help_text="How often escalation is applied (in months)"
     )
+
+    # Index-linked specific
+    index_name = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Index name for CPI_INDEX type e.g., 'CPI', 'WPI'"
+    )
+    index_base_value = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        null=True, blank=True,
+        help_text="Base index value"
+    )
+
+    # Step-wise escalation
+    step_schedule = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Step-wise escalation schedule"
+    )
+
+    # Timing
+    first_escalation_months = models.PositiveIntegerField(
+        default=12,
+        help_text="Months after rent start for first escalation"
+    )
     next_review_date = models.DateField(null=True, blank=True)
     effective_from = models.DateField(null=True, blank=True)
     effective_to = models.DateField(null=True, blank=True)
+
+    # Cap & Floor
+    cap_percentage = models.DecimalField(
+        max_digits=5, decimal_places=2,
+        null=True, blank=True,
+        help_text="Maximum escalation cap"
+    )
+    floor_percentage = models.DecimalField(
+        max_digits=5, decimal_places=2,
+        null=True, blank=True,
+        help_text="Minimum escalation floor"
+    )
+
+    # Apply to Other Charges
+    apply_to_cam = models.BooleanField(
+        default=False,
+        help_text="Apply escalation to CAM charges"
+    )
+    apply_to_parking = models.BooleanField(
+        default=False,
+        help_text="Apply escalation to Parking charges"
+    )
 
     class Meta:
         verbose_name = "Lease Escalation"
@@ -272,6 +554,30 @@ class LeaseEscalation(TenantModel):
 
     def __str__(self):
         return f"Escalation - {self.agreement.lease_id}"
+
+    def get_effective_escalation_type(self):
+        """Get escalation type from template if use_template_values is True."""
+        if self.use_template_values and self.template:
+            return self.template.escalation_type
+        return self.escalation_type
+
+    def get_effective_escalation_value(self):
+        """Get escalation value from template if use_template_values is True."""
+        if self.use_template_values and self.template:
+            return self.template.escalation_percentage
+        return self.escalation_value
+
+    def get_effective_frequency_months(self):
+        """Get frequency from template if use_template_values is True."""
+        if self.use_template_values and self.template:
+            freq_map = {
+                'ANNUAL': 12,
+                'EVERY_2_YEARS': 24,
+                'EVERY_3_YEARS': 36,
+                'EVERY_5_YEARS': 60,
+            }
+            return freq_map.get(self.template.frequency, 12)
+        return self.escalation_frequency_months
 
 
 class LeaseCAM(TenantModel):
@@ -412,8 +718,16 @@ class LeaseBilling(TenantModel):
 
 class LeaseTermination(TenantModel):
     """
-    Termination and break clause terms.
+    Termination, early exit, and break clause terms.
+
+    UI: Legal & Operational Clauses tab - Termination & Early Exit section
     """
+
+    class PenaltyType(models.TextChoices):
+        MONTHS_RENT = "MONTHS_RENT", "Months Rent"
+        FIXED_AMOUNT = "FIXED_AMOUNT", "Fixed Amount"
+        PERCENTAGE_REMAINING = "PERCENTAGE_REMAINING", "Percentage of Remaining Rent"
+        DEPOSIT_FORFEITURE = "DEPOSIT_FORFEITURE", "Security Deposit Forfeiture"
 
     agreement = models.OneToOneField(
         Agreement,
@@ -421,24 +735,146 @@ class LeaseTermination(TenantModel):
         related_name="termination"
     )
 
-    termination_clause = models.TextField(blank=True)
-    governing_law = models.CharField(max_length=100, default="India")
-    jurisdiction = models.CharField(max_length=100, blank=True)
-
-    # Break Clause
-    break_date = models.DateField(null=True, blank=True)
-    break_penalty = models.DecimalField(
-        max_digits=14, decimal_places=2,
-        null=True, blank=True
+    # =========================================================================
+    # TENANT EARLY EXIT
+    # =========================================================================
+    tenant_early_exit_permitted = models.BooleanField(
+        default=False,
+        help_text="Whether tenant can exit lease early"
     )
-    break_penalty_type = models.CharField(
-        max_length=50,
+    tenant_notice_days = models.PositiveIntegerField(
+        default=90,
+        help_text="Days notice required from tenant for early exit"
+    )
+    tenant_penalty_type = models.CharField(
+        max_length=30,
+        choices=PenaltyType.choices,
+        default=PenaltyType.MONTHS_RENT,
+        blank=True
+    )
+    tenant_penalty_value = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
         blank=True,
-        help_text="e.g., 'Months Rent', 'Fixed Amount'"
+        help_text="Penalty value (e.g., 3 for 3 months rent, or fixed amount)"
+    )
+    tenant_exit_conditions = models.TextField(
+        blank=True,
+        help_text="Conditions under which tenant can exit early"
+    )
+
+    # =========================================================================
+    # LANDLORD EARLY TERMINATION
+    # =========================================================================
+    landlord_early_termination_permitted = models.BooleanField(
+        default=False,
+        help_text="Whether landlord can terminate lease early"
+    )
+    landlord_notice_days = models.PositiveIntegerField(
+        default=180,
+        help_text="Days notice required from landlord for early termination"
+    )
+    landlord_compensation_type = models.CharField(
+        max_length=30,
+        choices=PenaltyType.choices,
+        default=PenaltyType.MONTHS_RENT,
+        blank=True
+    )
+    landlord_compensation_value = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Compensation value landlord must pay tenant"
+    )
+    landlord_relocation_assistance = models.BooleanField(
+        default=False,
+        help_text="Whether landlord must provide relocation assistance"
+    )
+    landlord_termination_conditions = models.TextField(
+        blank=True,
+        help_text="Conditions under which landlord can terminate"
+    )
+
+    # =========================================================================
+    # BREAK CLAUSE
+    # =========================================================================
+    break_clause_enabled = models.BooleanField(
+        default=False,
+        help_text="Whether a break clause exists"
+    )
+    break_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Specific date when break can be exercised"
+    )
+    break_window_start = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Start of window when break can be exercised"
+    )
+    break_window_end = models.DateField(
+        null=True,
+        blank=True,
+        help_text="End of window when break can be exercised"
     )
     break_notice_days = models.PositiveIntegerField(
-        null=True, blank=True,
-        help_text="Days notice required for break"
+        null=True,
+        blank=True,
+        help_text="Days notice required to exercise break"
+    )
+    break_penalty = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True
+    )
+    break_penalty_type = models.CharField(
+        max_length=30,
+        choices=PenaltyType.choices,
+        blank=True
+    )
+    break_conditions = models.TextField(
+        blank=True,
+        help_text="Conditions for exercising break clause"
+    )
+
+    # =========================================================================
+    # TERMINATION FOR CAUSE
+    # =========================================================================
+    termination_for_cause_events = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Events that allow termination for cause"
+    )
+    # Structure: ["Non-payment > 30 days", "Breach of use clause", "Bankruptcy"]
+
+    cure_period_days = models.PositiveIntegerField(
+        default=30,
+        help_text="Days allowed to cure breach before termination"
+    )
+
+    # =========================================================================
+    # GENERAL TERMINATION CLAUSE
+    # =========================================================================
+    termination_clause = models.TextField(
+        blank=True,
+        help_text="Full termination clause text"
+    )
+
+    # =========================================================================
+    # LEGACY FIELDS (kept for backward compatibility)
+    # =========================================================================
+    governing_law = models.CharField(
+        max_length=100,
+        default="India",
+        help_text="Deprecated: Use LeaseDisputeResolution instead"
+    )
+    jurisdiction = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Deprecated: Use LeaseDisputeResolution instead"
     )
 
     class Meta:
@@ -447,6 +883,26 @@ class LeaseTermination(TenantModel):
 
     def __str__(self):
         return f"Termination - {self.agreement.lease_id}"
+
+    def get_tenant_penalty_display(self):
+        """Get human-readable tenant penalty."""
+        if self.tenant_penalty_type == self.PenaltyType.MONTHS_RENT:
+            return f"{self.tenant_penalty_value} months rent"
+        elif self.tenant_penalty_type == self.PenaltyType.FIXED_AMOUNT:
+            return f"₹{self.tenant_penalty_value}"
+        elif self.tenant_penalty_type == self.PenaltyType.PERCENTAGE_REMAINING:
+            return f"{self.tenant_penalty_value}% of remaining rent"
+        elif self.tenant_penalty_type == self.PenaltyType.DEPOSIT_FORFEITURE:
+            return "Security deposit forfeiture"
+        return ""
+
+    def get_landlord_compensation_display(self):
+        """Get human-readable landlord compensation."""
+        if self.landlord_compensation_type == self.PenaltyType.MONTHS_RENT:
+            return f"{self.landlord_compensation_value} months rent"
+        elif self.landlord_compensation_type == self.PenaltyType.FIXED_AMOUNT:
+            return f"₹{self.landlord_compensation_value}"
+        return ""
 
 
 class UnitAllocation(TenantModel):
@@ -563,3 +1019,1049 @@ class LeaseNote(TenantModel):
 
     def __str__(self):
         return f"Note on {self.agreement.lease_id} by {self.created_by}"
+
+
+# =============================================================================
+# CLAUSE CONFIGURATION MODELS (Legal & Operational Clauses)
+# =============================================================================
+
+class LeaseRenewalOption(TenantModel):
+    """
+    Renewal options and cycles for a lease agreement.
+
+    UI: Legal & Operational Clauses tab - Renewal Options section
+    """
+
+    class RentFormula(models.TextChoices):
+        FIXED_ESCALATION = "FIXED_ESCALATION", "Base Rent + Fixed % Escalation"
+        MARKET_RATE = "MARKET_RATE", "Market Rate"
+        NEGOTIATED = "NEGOTIATED", "Negotiated"
+        CPI_LINKED = "CPI_LINKED", "CPI-Linked"
+        CAPPED_MARKET = "CAPPED_MARKET", "Market Rate with Cap"
+
+    agreement = models.OneToOneField(
+        Agreement,
+        on_delete=models.CASCADE,
+        related_name="renewal_option"
+    )
+
+    # Pre-Renewal Settings
+    pre_renewal_notice_days = models.PositiveIntegerField(
+        default=120,
+        help_text="Days before expiry tenant must notify intent to renew"
+    )
+    auto_renewal_enabled = models.BooleanField(
+        default=False,
+        help_text="Whether lease auto-renews if no notice given"
+    )
+    auto_renewal_term_months = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Term for auto-renewal if enabled"
+    )
+
+    # Renewal Cycles (stored as JSON for flexibility)
+    renewal_cycles = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="List of renewal cycles with terms"
+    )
+    # Structure:
+    # [
+    #     {"cycle": 1, "term_months": 36, "rent_formula": "FIXED_ESCALATION", "escalation_percent": 5},
+    #     {"cycle": 2, "term_months": 24, "rent_formula": "MARKET_RATE", "cap_percent": 10},
+    #     {"cycle": 3, "term_months": 12, "rent_formula": "NEGOTIATED"}
+    # ]
+
+    # Maximum renewals
+    max_renewal_cycles = models.PositiveIntegerField(
+        default=3,
+        help_text="Maximum number of renewal cycles allowed"
+    )
+
+    # Current renewal status
+    current_cycle = models.PositiveIntegerField(
+        default=0,
+        help_text="Current renewal cycle (0 = original term)"
+    )
+    last_renewal_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Date of last renewal"
+    )
+    next_renewal_deadline = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Deadline to exercise next renewal option"
+    )
+
+    # Notes
+    renewal_notes = models.TextField(
+        blank=True,
+        help_text="Additional renewal terms or conditions"
+    )
+
+    class Meta:
+        verbose_name = "Lease Renewal Option"
+        verbose_name_plural = "Lease Renewal Options"
+
+    def __str__(self):
+        return f"Renewal Options - {self.agreement.lease_id}"
+
+    def get_current_cycle_config(self):
+        """Get configuration for current renewal cycle."""
+        if self.renewal_cycles and self.current_cycle > 0:
+            for cycle in self.renewal_cycles:
+                if cycle.get("cycle") == self.current_cycle:
+                    return cycle
+        return None
+
+    def get_next_cycle_config(self):
+        """Get configuration for next renewal cycle."""
+        next_cycle = self.current_cycle + 1
+        if self.renewal_cycles and next_cycle <= self.max_renewal_cycles:
+            for cycle in self.renewal_cycles:
+                if cycle.get("cycle") == next_cycle:
+                    return cycle
+        return None
+
+
+class LeaseSubletSignage(TenantModel):
+    """
+    Sub-letting and signage rights for a lease agreement.
+
+    UI: Legal & Operational Clauses tab - Sub-letting & Signage Rights section
+    """
+
+    class SubletPermission(models.TextChoices):
+        PERMITTED = "PERMITTED", "Permitted"
+        PROHIBITED = "PROHIBITED", "Prohibited"
+        WITH_APPROVAL = "WITH_APPROVAL", "With Landlord Approval"
+
+    agreement = models.OneToOneField(
+        Agreement,
+        on_delete=models.CASCADE,
+        related_name="sublet_signage"
+    )
+
+    # =========================================================================
+    # SUB-LETTING
+    # =========================================================================
+    sublet_permission = models.CharField(
+        max_length=20,
+        choices=SubletPermission.choices,
+        default=SubletPermission.WITH_APPROVAL
+    )
+    sublet_approval_required = models.BooleanField(
+        default=True,
+        help_text="Whether landlord approval is required for sub-letting"
+    )
+    max_sublet_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Maximum percentage of area that can be sub-let"
+    )
+    sublet_restrictions = models.TextField(
+        blank=True,
+        help_text="Restrictions on who can be a sub-tenant (e.g., no competitors)"
+    )
+    sublet_rent_share_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Percentage of sub-let rent to be shared with landlord"
+    )
+
+    # =========================================================================
+    # SIGNAGE RIGHTS
+    # =========================================================================
+    signage_permitted = models.BooleanField(
+        default=True,
+        help_text="Whether tenant is allowed to display signage"
+    )
+    signage_approval_required = models.BooleanField(
+        default=True,
+        help_text="Whether landlord approval is required for signage"
+    )
+    signage_area_sqft = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Allowed signage area in square feet"
+    )
+    signage_locations = models.TextField(
+        blank=True,
+        help_text="Permitted signage locations (e.g., Main entrance, Building facade)"
+    )
+    signage_specifications = models.TextField(
+        blank=True,
+        help_text="Signage specifications (e.g., Backlit, max height, materials)"
+    )
+    signage_cost_responsibility = models.CharField(
+        max_length=50,
+        blank=True,
+        default="Tenant",
+        help_text="Who bears signage installation/maintenance costs"
+    )
+
+    class Meta:
+        verbose_name = "Lease Sublet & Signage"
+        verbose_name_plural = "Lease Sublet & Signage"
+
+    def __str__(self):
+        return f"Sublet & Signage - {self.agreement.lease_id}"
+
+
+class LeaseExclusivity(TenantModel):
+    """
+    Exclusivity and non-compete terms for a lease agreement.
+
+    UI: Legal & Operational Clauses tab - Exclusivity & Non-Compete section
+    """
+
+    agreement = models.OneToOneField(
+        Agreement,
+        on_delete=models.CASCADE,
+        related_name="exclusivity"
+    )
+
+    # =========================================================================
+    # EXCLUSIVE USE
+    # =========================================================================
+    exclusive_use_granted = models.BooleanField(
+        default=False,
+        help_text="Whether tenant has exclusive use rights for their business category"
+    )
+    exclusive_category = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Business category for exclusivity (e.g., Coffee Shop & Cafe)"
+    )
+    exclusive_radius = models.CharField(
+        max_length=100,
+        blank=True,
+        default="Within Property",
+        help_text="Radius of exclusivity (Within Property, Floor, Building, Campus)"
+    )
+    exclusive_exceptions = models.TextField(
+        blank=True,
+        help_text="Exceptions to exclusivity (e.g., existing tenants, food courts)"
+    )
+
+    # Excluded Categories (what landlord cannot lease to)
+    excluded_categories = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Categories landlord cannot lease to"
+    )
+    # Structure: ["Fast Food", "Convenience Store", "Food Court"]
+
+    # =========================================================================
+    # NON-COMPETE
+    # =========================================================================
+    non_compete_enabled = models.BooleanField(
+        default=False,
+        help_text="Whether non-compete clause is active"
+    )
+    non_compete_duration_months = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Duration of non-compete after lease termination (months)"
+    )
+    non_compete_radius_km = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Geographic radius for non-compete (in km)"
+    )
+    non_compete_scope = models.TextField(
+        blank=True,
+        help_text="Scope of non-compete (e.g., Same business line, Similar products)"
+    )
+
+    # Breach Penalties
+    exclusivity_breach_penalty = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Penalty amount if landlord breaches exclusivity"
+    )
+    non_compete_breach_penalty = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Penalty amount if tenant breaches non-compete"
+    )
+
+    class Meta:
+        verbose_name = "Lease Exclusivity"
+        verbose_name_plural = "Lease Exclusivities"
+
+    def __str__(self):
+        return f"Exclusivity - {self.agreement.lease_id}"
+
+
+class LeaseInsuranceRequirement(TenantModel):
+    """
+    Insurance requirements and reinstatement terms for a lease agreement.
+
+    UI: Legal & Operational Clauses tab - Reinstatement & Insurance section
+    """
+
+    class RestoreCondition(models.TextChoices):
+        ORIGINAL = "ORIGINAL", "Original Condition"
+        BROOM_CLEAN = "BROOM_CLEAN", "Broom Clean"
+        AS_IS = "AS_IS", "As-Is"
+        IMPROVED = "IMPROVED", "Improved Condition"
+
+    agreement = models.OneToOneField(
+        Agreement,
+        on_delete=models.CASCADE,
+        related_name="insurance_requirement"
+    )
+
+    # =========================================================================
+    # REINSTATEMENT
+    # =========================================================================
+    restore_condition = models.CharField(
+        max_length=20,
+        choices=RestoreCondition.choices,
+        default=RestoreCondition.ORIGINAL,
+        help_text="Condition premises must be returned in"
+    )
+    restore_exceptions = models.TextField(
+        blank=True,
+        help_text="Alterations exempt from restoration (e.g., approved modifications)"
+    )
+    reinstatement_deposit = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Deposit held for reinstatement"
+    )
+    reinstatement_timeline_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Days allowed for reinstatement after lease end"
+    )
+
+    # =========================================================================
+    # PUBLIC LIABILITY INSURANCE
+    # =========================================================================
+    public_liability_required = models.BooleanField(
+        default=True,
+        help_text="Whether public liability insurance is required"
+    )
+    public_liability_coverage = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Required coverage amount"
+    )
+    public_liability_currency = models.CharField(
+        max_length=3,
+        default="INR"
+    )
+
+    # =========================================================================
+    # PROPERTY INSURANCE
+    # =========================================================================
+    property_insurance_required = models.BooleanField(
+        default=True,
+        help_text="Whether property/contents insurance is required"
+    )
+    property_insurance_coverage = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Required coverage amount"
+    )
+
+    # =========================================================================
+    # BUSINESS INTERRUPTION INSURANCE
+    # =========================================================================
+    business_interruption_required = models.BooleanField(
+        default=False,
+        help_text="Whether business interruption insurance is required"
+    )
+    business_interruption_coverage_months = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Months of revenue coverage required"
+    )
+
+    # =========================================================================
+    # OTHER INSURANCE REQUIREMENTS
+    # =========================================================================
+    other_insurance_requirements = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Other insurance requirements"
+    )
+    # Structure: [{"type": "Workers Comp", "required": true, "coverage": 500000}]
+
+    # =========================================================================
+    # LANDLORD AS ADDITIONAL INSURED
+    # =========================================================================
+    landlord_additional_insured = models.BooleanField(
+        default=True,
+        help_text="Whether landlord should be named as additional insured"
+    )
+
+    # =========================================================================
+    # PROOF REQUIREMENTS
+    # =========================================================================
+    proof_required = models.BooleanField(
+        default=True,
+        help_text="Whether tenant must provide proof of insurance"
+    )
+    proof_frequency = models.CharField(
+        max_length=50,
+        default="Annual",
+        help_text="How often proof must be submitted (Annual, Semi-Annual, etc.)"
+    )
+    proof_due_days_before_expiry = models.PositiveIntegerField(
+        default=30,
+        help_text="Days before policy expiry to submit renewal proof"
+    )
+
+    class Meta:
+        verbose_name = "Lease Insurance Requirement"
+        verbose_name_plural = "Lease Insurance Requirements"
+
+    def __str__(self):
+        return f"Insurance Requirements - {self.agreement.lease_id}"
+
+
+class LeaseDisputeResolution(TenantModel):
+    """
+    Dispute resolution and governing law terms for a lease agreement.
+
+    UI: Legal & Operational Clauses tab - Dispute Resolution & Governing Law section
+    """
+
+    class DisputeMechanism(models.TextChoices):
+        MEDIATION = "MEDIATION", "Mediation"
+        ARBITRATION = "ARBITRATION", "Arbitration"
+        LITIGATION = "LITIGATION", "Litigation"
+        MED_ARB = "MED_ARB", "Mediation then Arbitration"
+        NEGOTIATION = "NEGOTIATION", "Negotiation"
+
+    agreement = models.OneToOneField(
+        Agreement,
+        on_delete=models.CASCADE,
+        related_name="dispute_resolution"
+    )
+
+    # =========================================================================
+    # DISPUTE MECHANISM
+    # =========================================================================
+    dispute_mechanism = models.CharField(
+        max_length=20,
+        choices=DisputeMechanism.choices,
+        default=DisputeMechanism.ARBITRATION
+    )
+
+    # =========================================================================
+    # ARBITRATION DETAILS
+    # =========================================================================
+    arbitration_seat = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Seat/place of arbitration (e.g., Mumbai)"
+    )
+    arbitration_rules = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Applicable arbitration rules (e.g., Indian Arbitration Act)"
+    )
+    arbitration_language = models.CharField(
+        max_length=50,
+        default="English",
+        help_text="Language of arbitration proceedings"
+    )
+    number_of_arbitrators = models.PositiveIntegerField(
+        default=1,
+        help_text="Number of arbitrators (1 or 3 typically)"
+    )
+    arbitration_institution = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Arbitration institution (e.g., ICC, LCIA, Ad-hoc)"
+    )
+
+    # =========================================================================
+    # MEDIATION DETAILS
+    # =========================================================================
+    mediation_required_first = models.BooleanField(
+        default=False,
+        help_text="Whether mediation is required before arbitration/litigation"
+    )
+    mediation_period_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Days allowed for mediation before escalation"
+    )
+    mediation_venue = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Venue for mediation"
+    )
+
+    # =========================================================================
+    # GOVERNING LAW
+    # =========================================================================
+    governing_law_country = models.CharField(
+        max_length=100,
+        default="India",
+        help_text="Country whose laws govern the agreement"
+    )
+    governing_law_state = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="State/Province whose laws govern (if applicable)"
+    )
+    jurisdiction_court = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Courts having jurisdiction (e.g., Mumbai High Court)"
+    )
+    exclusive_jurisdiction = models.BooleanField(
+        default=True,
+        help_text="Whether jurisdiction is exclusive"
+    )
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    dispute_summary = models.TextField(
+        blank=True,
+        help_text="Human-readable summary of dispute resolution terms"
+    )
+
+    class Meta:
+        verbose_name = "Lease Dispute Resolution"
+        verbose_name_plural = "Lease Dispute Resolutions"
+
+    def __str__(self):
+        return f"Dispute Resolution - {self.agreement.lease_id}"
+
+
+# =============================================================================
+# AMENDMENT & VERSIONING MODELS
+# =============================================================================
+
+class LeaseAmendment(TenantModel):
+    """
+    Tracks amendments/changes to lease agreements over time.
+    Each amendment creates a new version of the lease.
+
+    UI: Amendment & Versioning tab
+    """
+
+    class AmendmentType(models.TextChoices):
+        ORIGINAL = "ORIGINAL", "Original Agreement"
+        RENT_REVISION = "RENT_REVISION", "Rent Revision"
+        AREA_CHANGE = "AREA_CHANGE", "Area Change"
+        TERM_EXTENSION = "TERM_EXTENSION", "Term Extension"
+        RENEWAL = "RENEWAL", "Renewal"
+        EARLY_TERMINATION = "EARLY_TERMINATION", "Early Termination"
+        PARTY_CHANGE = "PARTY_CHANGE", "Party Change (Assignment)"
+        CLAUSE_MODIFICATION = "CLAUSE_MODIFICATION", "Clause Modification"
+        ADDENDUM = "ADDENDUM", "Addendum"
+        OTHER = "OTHER", "Other"
+
+    class ApprovalStatus(models.TextChoices):
+        DRAFT = "DRAFT", "Draft"
+        PENDING_REVIEW = "PENDING_REVIEW", "Pending Review"
+        UNDER_NEGOTIATION = "UNDER_NEGOTIATION", "Under Negotiation"
+        PENDING_APPROVAL = "PENDING_APPROVAL", "Pending Approval"
+        APPROVED = "APPROVED", "Approved"
+        EXECUTED = "EXECUTED", "Executed"
+        REJECTED = "REJECTED", "Rejected"
+        SUPERSEDED = "SUPERSEDED", "Superseded"
+
+    agreement = models.ForeignKey(
+        Agreement,
+        on_delete=models.CASCADE,
+        related_name="amendments"
+    )
+
+    # Amendment Identification
+    amendment_id = models.CharField(
+        max_length=50,
+        help_text="Auto-generated amendment ID (e.g., AMD-2023-042)"
+    )
+    amendment_type = models.CharField(
+        max_length=30,
+        choices=AmendmentType.choices,
+        default=AmendmentType.OTHER
+    )
+    title = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Brief title describing the amendment"
+    )
+
+    # Version Tracking
+    previous_version = models.CharField(
+        max_length=20,
+        blank=True,
+        help_text="Previous agreement version (e.g., v1.0)"
+    )
+    new_version = models.CharField(
+        max_length=20,
+        blank=True,
+        help_text="New agreement version after this amendment (e.g., v1.1)"
+    )
+    is_major_version = models.BooleanField(
+        default=False,
+        help_text="Whether this is a major version change (v1.x → v2.0)"
+    )
+
+    # Dates
+    amendment_date = models.DateField(
+        help_text="Date amendment was created/signed"
+    )
+    effective_from = models.DateField(
+        help_text="Date amendment takes effect"
+    )
+    effective_to = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Date amendment expires (if temporary)"
+    )
+
+    # Status
+    approval_status = models.CharField(
+        max_length=20,
+        choices=ApprovalStatus.choices,
+        default=ApprovalStatus.DRAFT
+    )
+
+    # Changes Summary (stored as JSON for flexibility)
+    changes_summary = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Summary of changes made"
+    )
+    # Structure:
+    # [
+    #     {"field": "Base Rent", "previous": "₹1,00,000", "new": "₹1,05,000"},
+    #     {"field": "CAM Rate", "previous": "₹25/sqft", "new": "₹27/sqft"}
+    # ]
+
+    # Full Description
+    description = models.TextField(
+        blank=True,
+        help_text="Detailed description of the amendment"
+    )
+
+    # Reason
+    reason = models.TextField(
+        blank=True,
+        help_text="Reason for the amendment"
+    )
+
+    # Parties
+    initiated_by = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Who initiated the amendment (Tenant/Landlord)"
+    )
+
+    # Metadata
+    executed_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Date amendment was formally executed"
+    )
+
+    class Meta:
+        verbose_name = "Lease Amendment"
+        verbose_name_plural = "Lease Amendments"
+        ordering = ["-amendment_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope", "amendment_id"],
+                name="unique_amendment_id_per_scope"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.amendment_id} - {self.agreement.lease_id}"
+
+    def save(self, *args, **kwargs):
+        # Auto-generate amendment_id if not provided
+        if not self.amendment_id:
+            from datetime import datetime
+            year = datetime.now().year
+            count = LeaseAmendment.objects.filter(
+                scope=self.scope,
+                created_at__year=year
+            ).count() + 1
+            self.amendment_id = f"AMD-{year}-{count:03d}"
+        super().save(*args, **kwargs)
+
+
+class AmendmentApproval(TenantModel):
+    """
+    Approval workflow steps for lease amendments.
+
+    UI: Amendment & Versioning tab - Approval Workflow section
+    """
+
+    class ApprovalStepStatus(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+        SKIPPED = "SKIPPED", "Skipped"
+
+    amendment = models.ForeignKey(
+        LeaseAmendment,
+        on_delete=models.CASCADE,
+        related_name="approvals"
+    )
+
+    # Step Details
+    step_order = models.PositiveIntegerField(
+        default=1,
+        help_text="Order of this approval step"
+    )
+    step_name = models.CharField(
+        max_length=100,
+        help_text="Name of approval step (e.g., Legal Review, Finance Review)"
+    )
+    step_description = models.TextField(
+        blank=True,
+        help_text="Description of what this step entails"
+    )
+
+    # Approver
+    approver = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="amendment_approvals"
+    )
+    approver_role = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Role required for approval (e.g., Legal Manager)"
+    )
+
+    # Status
+    status = models.CharField(
+        max_length=20,
+        choices=ApprovalStepStatus.choices,
+        default=ApprovalStepStatus.PENDING
+    )
+
+    # Action Details
+    actioned_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When action was taken"
+    )
+    comments = models.TextField(
+        blank=True,
+        help_text="Approver's comments"
+    )
+
+    # Deadline
+    due_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Deadline for this approval step"
+    )
+
+    class Meta:
+        verbose_name = "Amendment Approval"
+        verbose_name_plural = "Amendment Approvals"
+        ordering = ["amendment", "step_order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["amendment", "step_order"],
+                name="unique_amendment_approval_step"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.step_name} - {self.amendment.amendment_id}"
+
+
+class AmendmentAttachment(TenantModel):
+    """
+    Documents attached to a lease amendment.
+
+    UI: Amendment & Versioning tab - Attachments section
+    """
+
+    class AttachmentType(models.TextChoices):
+        AMENDMENT_AGREEMENT = "AMENDMENT_AGREEMENT", "Amendment Agreement"
+        SIGNED_ADDENDUM = "SIGNED_ADDENDUM", "Signed Addendum"
+        SUPPORTING_DOC = "SUPPORTING_DOC", "Supporting Document"
+        APPROVAL_DOC = "APPROVAL_DOC", "Approval Document"
+        CORRESPONDENCE = "CORRESPONDENCE", "Correspondence"
+        OTHER = "OTHER", "Other"
+
+    amendment = models.ForeignKey(
+        LeaseAmendment,
+        on_delete=models.CASCADE,
+        related_name="attachments"
+    )
+
+    # File Details
+    title = models.CharField(max_length=255)
+    attachment_type = models.CharField(
+        max_length=30,
+        choices=AttachmentType.choices,
+        default=AttachmentType.OTHER
+    )
+    file = models.FileField(upload_to="amendment_attachments/%Y/%m/")
+    file_size = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="File size in bytes"
+    )
+    mime_type = models.CharField(max_length=100, blank=True)
+
+    # Description
+    description = models.TextField(blank=True)
+
+    # Uploader
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="uploaded_amendment_attachments"
+    )
+
+    class Meta:
+        verbose_name = "Amendment Attachment"
+        verbose_name_plural = "Amendment Attachments"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.title} - {self.amendment.amendment_id}"
+
+
+# =============================================================================
+# DOCUMENT LINKS (Enhanced Document Management)
+# =============================================================================
+
+class LeaseLinkedDocument(TenantModel):
+    """
+    Enhanced document management for lease agreements.
+    Links documents with categories, expiry tracking, and approval workflow.
+
+    UI: Document Links tab
+    """
+
+    class DocumentCategory(models.TextChoices):
+        LEGAL = "LEGAL", "Legal Documents"
+        COMPLIANCE = "COMPLIANCE", "Compliance Documents"
+        FINANCIAL = "FINANCIAL", "Financial Documents"
+        CORRESPONDENCE = "CORRESPONDENCE", "Correspondence"
+        INSURANCE = "INSURANCE", "Insurance Documents"
+        PERMITS = "PERMITS", "Permits & Licenses"
+        OTHER = "OTHER", "Other"
+
+    class DocumentStatus(models.TextChoices):
+        DRAFT = "DRAFT", "Draft"
+        PENDING_REVIEW = "PENDING_REVIEW", "Pending Review"
+        PENDING_SIGNATURE = "PENDING_SIGNATURE", "Pending Signature"
+        EXECUTED = "EXECUTED", "Executed"
+        VALID = "VALID", "Valid"
+        EXPIRING = "EXPIRING", "Expiring Soon"
+        EXPIRED = "EXPIRED", "Expired"
+        SUPERSEDED = "SUPERSEDED", "Superseded"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    agreement = models.ForeignKey(
+        Agreement,
+        on_delete=models.CASCADE,
+        related_name="linked_documents"
+    )
+
+    # Document Details
+    title = models.CharField(max_length=255)
+    category = models.CharField(
+        max_length=20,
+        choices=DocumentCategory.choices,
+        default=DocumentCategory.OTHER
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=DocumentStatus.choices,
+        default=DocumentStatus.DRAFT
+    )
+
+    # File
+    file = models.FileField(
+        upload_to="lease_linked_documents/%Y/%m/",
+        null=True,
+        blank=True
+    )
+    file_size = models.PositiveIntegerField(null=True, blank=True)
+    mime_type = models.CharField(max_length=100, blank=True)
+    external_url = models.URLField(
+        blank=True,
+        help_text="External link if document is stored elsewhere"
+    )
+
+    # Version
+    version = models.CharField(
+        max_length=20,
+        blank=True,
+        help_text="Document version (e.g., v1.0, v2.0)"
+    )
+
+    # Dates
+    document_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Date on the document"
+    )
+    effective_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="When document becomes effective"
+    )
+    expiry_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="When document expires"
+    )
+
+    # Renewal Tracking
+    requires_renewal = models.BooleanField(
+        default=False,
+        help_text="Whether this document needs periodic renewal"
+    )
+    renewal_reminder_days = models.PositiveIntegerField(
+        default=30,
+        help_text="Days before expiry to send renewal reminder"
+    )
+
+    # Description
+    description = models.TextField(blank=True)
+    notes = models.TextField(blank=True)
+
+    # Uploader
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="uploaded_lease_documents"
+    )
+
+    class Meta:
+        verbose_name = "Lease Linked Document"
+        verbose_name_plural = "Lease Linked Documents"
+        ordering = ["category", "-created_at"]
+
+    def __str__(self):
+        return f"{self.title} - {self.agreement.lease_id}"
+
+    @property
+    def is_expiring_soon(self):
+        """Check if document is expiring within reminder period."""
+        if not self.expiry_date:
+            return False
+        from datetime import date, timedelta
+        warning_date = self.expiry_date - timedelta(days=self.renewal_reminder_days)
+        return date.today() >= warning_date and date.today() < self.expiry_date
+
+    @property
+    def is_expired(self):
+        """Check if document has expired."""
+        if not self.expiry_date:
+            return False
+        from datetime import date
+        return date.today() > self.expiry_date
+
+    def save(self, *args, **kwargs):
+        # Auto-update status based on expiry
+        if self.expiry_date:
+            from datetime import date, timedelta
+            today = date.today()
+            if today > self.expiry_date:
+                self.status = self.DocumentStatus.EXPIRED
+            elif today >= self.expiry_date - timedelta(days=self.renewal_reminder_days):
+                if self.status not in [self.DocumentStatus.EXPIRED, self.DocumentStatus.SUPERSEDED]:
+                    self.status = self.DocumentStatus.EXPIRING
+        super().save(*args, **kwargs)
+
+
+class DocumentApproval(TenantModel):
+    """
+    Approval workflow for lease linked documents.
+
+    UI: Document Links tab - Approval Workflow
+    """
+
+    class ApprovalStatus(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+        SKIPPED = "SKIPPED", "Skipped"
+
+    document = models.ForeignKey(
+        LeaseLinkedDocument,
+        on_delete=models.CASCADE,
+        related_name="approvals"
+    )
+
+    # Step Details
+    step_order = models.PositiveIntegerField(default=1)
+    step_name = models.CharField(max_length=100)
+
+    # Approver
+    approver = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="document_approvals"
+    )
+    approver_role = models.CharField(max_length=100, blank=True)
+
+    # Status
+    status = models.CharField(
+        max_length=20,
+        choices=ApprovalStatus.choices,
+        default=ApprovalStatus.PENDING
+    )
+
+    # Action
+    actioned_at = models.DateTimeField(null=True, blank=True)
+    comments = models.TextField(blank=True)
+
+    class Meta:
+        verbose_name = "Document Approval"
+        verbose_name_plural = "Document Approvals"
+        ordering = ["document", "step_order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["document", "step_order"],
+                name="unique_document_approval_step"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.step_name} - {self.document.title}"
