@@ -538,7 +538,7 @@ class BillingConfigBundleView(APIView):
     def get_active_scope(self):
         """Get scope from request header."""
         from apps.core.models import TenantScope
-        scope_id = self.request.headers.get("X-Tenant-Scope")
+        scope_id = self.request.headers.get("X-Scope-ID") or self.request.headers.get("X-Tenant-Scope")
         if not scope_id:
             return None
         try:
@@ -550,7 +550,7 @@ class BillingConfigBundleView(APIView):
         scope = self.get_active_scope()
         if not scope:
             return Response(
-                {"error": "X-Tenant-Scope header required"},
+                {"error": "X-Scope-ID header required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -596,7 +596,7 @@ class SiteBillingConfigBundleView(APIView):
 
     def get_active_scope(self):
         from apps.core.models import TenantScope
-        scope_id = self.request.headers.get("X-Tenant-Scope")
+        scope_id = self.request.headers.get("X-Scope-ID") or self.request.headers.get("X-Tenant-Scope")
         if not scope_id:
             return None
         try:
@@ -608,7 +608,7 @@ class SiteBillingConfigBundleView(APIView):
         scope = self.get_active_scope()
         if not scope:
             return Response(
-                {"error": "X-Tenant-Scope header required"},
+                {"error": "X-Scope-ID header required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 

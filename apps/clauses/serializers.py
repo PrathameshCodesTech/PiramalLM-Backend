@@ -64,11 +64,12 @@ class ClauseVersionListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for version history list."""
     version_label = serializers.ReadOnlyField()
     created_by_name = serializers.SerializerMethodField()
+    clause_title = serializers.CharField(source="clause.title", read_only=True)
 
     class Meta:
         model = models.ClauseVersion
         fields = (
-            "id", "version_label", "major_version", "minor_version",
+            "id", "clause", "clause_title", "version_label", "major_version", "minor_version",
             "version_status", "change_summary", "bump_type",
             "created_at", "created_by_name"
         )

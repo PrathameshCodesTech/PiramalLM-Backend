@@ -28,25 +28,36 @@ def generate_password(length=12):
 
 def validate_scope_header(request):
     """
-    Validate X-Scope-ID header for non-superusers.
+    Validate X-Scope-ID header for bootstrap endpoints (/me/, /me/available-scopes/).
+
     Returns (scope, error_response) tuple.
-    - If valid: (scope, None)
-    - If invalid/missing: (None, PermissionDenied)
+    - Header provided + valid: (scope, None)
+    - Header not provided: (None, None) — caller must handle unscoped access
+    - Header provided + invalid: raises PermissionDenied
+
+    Without header, both superusers and non-superusers get (None, None).
+    The calling view is responsible for scoping data appropriately:
+    - Superuser + None scope → all system data
+    - Non-superuser + None scope → only data from user's memberships
     """
     from rest_framework.exceptions import PermissionDenied
 
     user = request.user
     header_scope_id = request.headers.get("X-Scope-ID")
 
-    # Superuser without header - allowed, returns None scope (means "all")
-    if user.is_superuser and not header_scope_id:
-        return None, None
-
-    # Non-superuser without header - error
+    # No header: allowed for all users (bootstrap scenario — scope picker, initial login)
     if not header_scope_id:
-        raise PermissionDenied(
-            "X-Scope-ID header is required. Pass a scope id you have access to."
-        )
+        # Verify user has at least one active membership (unless superuser)
+        if not user.is_superuser:
+            has_membership = models.ScopeMembership.objects.filter(
+                user=user, is_active=True
+            ).exists()
+            if not has_membership:
+                raise PermissionDenied(
+                    "No active scope memberships found for your account. "
+                    "Contact your administrator to be assigned to a scope."
+                )
+        return None, None
 
     # Validate scope exists
     try:
@@ -209,10 +220,18 @@ def available_scopes(request):
 
     # Get scopes within boundary
     if boundary_scope_ids is None:
-        # Superuser without header - all scopes
-        all_scopes = models.TenantScope.objects.select_related(
+        base_qs = models.TenantScope.objects.select_related(
             "org", "company", "company__org", "entity", "entity__company", "entity__company__org", "site"
-        ).filter(is_active=True)
+        )
+        if user.is_superuser:
+            # Superuser without header — all system scopes
+            all_scopes = base_qs.filter(is_active=True)
+        else:
+            # Non-superuser without header — only scopes from their memberships
+            user_scope_ids = models.ScopeMembership.objects.filter(
+                user=user, is_active=True
+            ).values_list("scope_id", flat=True)
+            all_scopes = base_qs.filter(id__in=user_scope_ids, is_active=True)
     else:
         # Filter to boundary
         all_scopes = models.TenantScope.objects.select_related(
