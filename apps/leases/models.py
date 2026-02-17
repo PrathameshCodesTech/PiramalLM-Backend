@@ -1470,7 +1470,13 @@ class LeaseSubletSignage(TenantModel):
         decimal_places=2,
         null=True,
         blank=True,
-        help_text="Allowed signage area in square feet"
+        help_text="Allowed signage area (unit in signage_area_unit)"
+    )
+    signage_area_unit = models.CharField(
+        max_length=10,
+        choices=[("SQFT", "Square Feet"), ("SQM", "Square Meters")],
+        default="SQFT",
+        help_text="Unit for signage area (SQFT or SQM)"
     )
     signage_locations = models.TextField(
         blank=True,
@@ -1619,6 +1625,10 @@ class LeaseInsuranceRequirement(TenantModel):
         blank=True,
         help_text="Alterations exempt from restoration (e.g., approved modifications)"
     )
+    restore_details = models.TextField(
+        blank=True,
+        help_text="Free-text reinstatement details (e.g., Return to original white box condition)"
+    )
     reinstatement_deposit = models.DecimalField(
         max_digits=14,
         decimal_places=2,
@@ -1712,6 +1722,14 @@ class LeaseInsuranceRequirement(TenantModel):
     proof_due_days_before_expiry = models.PositiveIntegerField(
         default=30,
         help_text="Days before policy expiry to submit renewal proof"
+    )
+
+    # =========================================================================
+    # INDEMNITY
+    # =========================================================================
+    indemnity_notes = models.TextField(
+        blank=True,
+        help_text="Indemnity clause text / notes"
     )
 
     class Meta:
