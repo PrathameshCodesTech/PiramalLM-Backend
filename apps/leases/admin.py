@@ -46,8 +46,18 @@ class LeaseBillingAdmin(admin.ModelAdmin):
 
 @admin.register(models.UnitAllocation)
 class UnitAllocationAdmin(admin.ModelAdmin):
-    list_display = ("agreement", "unit", "allocation_mode", "allocated_area_sqft", "monthly_rent")
-    list_filter = ("allocation_mode", "is_active")
+    list_display = (
+        "agreement",
+        "allocation_level",
+        "site",
+        "tower",
+        "floor",
+        "unit",
+        "allocation_mode",
+        "allocated_area_sqft",
+        "monthly_rent",
+    )
+    list_filter = ("allocation_level", "allocation_mode", "is_active")
     search_fields = ("agreement__lease_id",)
 
 

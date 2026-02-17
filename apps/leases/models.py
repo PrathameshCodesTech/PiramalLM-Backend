@@ -2,7 +2,7 @@ from django.db import models
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, MaxValueValidator
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from apps.core.models import TenantModel
 
 
@@ -367,6 +367,20 @@ class LeaseRentFree(TenantModel):
     rent_free_start_date = models.DateField(null=True, blank=True)
     rent_free_days = models.PositiveIntegerField(null=True, blank=True)
     rent_free_end_date = models.DateField(null=True, blank=True)
+    extended_buffer_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Additional days after rent-free period where partial rent is charged"
+    )
+    extended_buffer_charge_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        default=Decimal("50.00"),
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Charge percentage during extended buffer days"
+    )
 
     # Fit-out Period
     fitout_start_date = models.DateField(null=True, blank=True)
@@ -907,22 +921,57 @@ class LeaseTermination(TenantModel):
 
 class UnitAllocation(TenantModel):
     """
-    Unit allocation for a lease agreement.
+    Granular allocation target for a lease agreement.
+    Supports allocation at site/tower/floor/unit level.
     """
 
     class AllocationMode(models.TextChoices):
-        FULL = "FULL", "Full Unit"
-        PARTIAL = "PARTIAL", "Partial Unit"
+        FULL = "FULL", "Full"
+        PARTIAL = "PARTIAL", "Partial"
+
+    class AllocationLevel(models.TextChoices):
+        SITE = "SITE", "Site"
+        TOWER = "TOWER", "Tower"
+        FLOOR = "FLOOR", "Floor"
+        UNIT = "UNIT", "Unit"
 
     agreement = models.ForeignKey(
         Agreement,
         on_delete=models.CASCADE,
         related_name="unit_allocations"
     )
+    allocation_level = models.CharField(
+        max_length=10,
+        choices=AllocationLevel.choices,
+        default=AllocationLevel.UNIT
+    )
+    site = models.ForeignKey(
+        "properties.Site",
+        on_delete=models.PROTECT,
+        related_name="lease_allocations",
+        null=True,
+        blank=True
+    )
+    tower = models.ForeignKey(
+        "properties.Tower",
+        on_delete=models.PROTECT,
+        related_name="lease_allocations",
+        null=True,
+        blank=True
+    )
+    floor = models.ForeignKey(
+        "properties.Floor",
+        on_delete=models.PROTECT,
+        related_name="lease_allocations",
+        null=True,
+        blank=True
+    )
     unit = models.ForeignKey(
         "properties.Unit",
         on_delete=models.PROTECT,
-        related_name="lease_allocations"
+        related_name="lease_allocations",
+        null=True,
+        blank=True
     )
 
     allocation_mode = models.CharField(
@@ -945,19 +994,248 @@ class UnitAllocation(TenantModel):
         verbose_name = "Unit Allocation"
         verbose_name_plural = "Unit Allocations"
         constraints = [
+            models.CheckConstraint(
+                condition=(
+                    (
+                        models.Q(site__isnull=False)
+                        & models.Q(tower__isnull=True)
+                        & models.Q(floor__isnull=True)
+                        & models.Q(unit__isnull=True)
+                    )
+                    | (
+                        models.Q(site__isnull=True)
+                        & models.Q(tower__isnull=False)
+                        & models.Q(floor__isnull=True)
+                        & models.Q(unit__isnull=True)
+                    )
+                    | (
+                        models.Q(site__isnull=True)
+                        & models.Q(tower__isnull=True)
+                        & models.Q(floor__isnull=False)
+                        & models.Q(unit__isnull=True)
+                    )
+                    | (
+                        models.Q(site__isnull=True)
+                        & models.Q(tower__isnull=True)
+                        & models.Q(floor__isnull=True)
+                        & models.Q(unit__isnull=False)
+                    )
+                ),
+                name="ck_alloc_single_target",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    (
+                        models.Q(allocation_level="SITE")
+                        & models.Q(site__isnull=False)
+                        & models.Q(tower__isnull=True)
+                        & models.Q(floor__isnull=True)
+                        & models.Q(unit__isnull=True)
+                    )
+                    | (
+                        models.Q(allocation_level="TOWER")
+                        & models.Q(site__isnull=True)
+                        & models.Q(tower__isnull=False)
+                        & models.Q(floor__isnull=True)
+                        & models.Q(unit__isnull=True)
+                    )
+                    | (
+                        models.Q(allocation_level="FLOOR")
+                        & models.Q(site__isnull=True)
+                        & models.Q(tower__isnull=True)
+                        & models.Q(floor__isnull=False)
+                        & models.Q(unit__isnull=True)
+                    )
+                    | (
+                        models.Q(allocation_level="UNIT")
+                        & models.Q(site__isnull=True)
+                        & models.Q(tower__isnull=True)
+                        & models.Q(floor__isnull=True)
+                        & models.Q(unit__isnull=False)
+                    )
+                ),
+                name="ck_alloc_level_target_match",
+            ),
+            models.UniqueConstraint(
+                fields=["agreement", "site"],
+                condition=models.Q(site__isnull=False),
+                name="uq_alloc_agreement_site",
+            ),
+            models.UniqueConstraint(
+                fields=["agreement", "tower"],
+                condition=models.Q(tower__isnull=False),
+                name="uq_alloc_agreement_tower",
+            ),
+            models.UniqueConstraint(
+                fields=["agreement", "floor"],
+                condition=models.Q(floor__isnull=False),
+                name="uq_alloc_agreement_floor",
+            ),
             models.UniqueConstraint(
                 fields=["agreement", "unit"],
-                name="unique_unit_per_agreement"
+                condition=models.Q(unit__isnull=False),
+                name="uq_alloc_agreement_unit",
             )
         ]
 
     def __str__(self):
-        return f"{self.agreement.lease_id} - {self.unit}"
+        target = self.site or self.tower or self.floor or self.unit
+        return f"{self.agreement.lease_id} - {self.allocation_level} - {target}"
+
+    @classmethod
+    def _blocking_statuses(cls):
+        return [
+            Agreement.Status.DRAFT,
+            Agreement.Status.PENDING,
+            Agreement.Status.ACTIVE,
+        ]
+
+    def _target_field_and_obj(self):
+        target_map = {
+            "site": self.site,
+            "tower": self.tower,
+            "floor": self.floor,
+            "unit": self.unit,
+        }
+        targets = [(field, obj) for field, obj in target_map.items() if obj is not None]
+        if len(targets) != 1:
+            return None, None
+        return targets[0]
+
+    def _target_area(self):
+        if self.site:
+            return self.site.leasable_area_sqft
+        if self.tower:
+            return self.tower.leasable_area_sqft
+        if self.floor:
+            return self.floor.leasable_area_sqft
+        if self.unit:
+            return self.unit.leasable_area_sqft
+        return None
+
+    def _effective_rate_per_sqft(self):
+        if not self.agreement_id:
+            return None
+        try:
+            financials = self.agreement.financials
+            if financials.rate_per_sqft_monthly is not None:
+                return Decimal(financials.rate_per_sqft_monthly)
+        except LeaseFinancials.DoesNotExist:
+            pass
+        if self.agreement.site and self.agreement.site.base_rate_sqft is not None:
+            return Decimal(self.agreement.site.base_rate_sqft)
+        return None
+
+    def _calculated_monthly_rent(self):
+        if self.allocated_area_sqft is None:
+            return None
+        rate = self._effective_rate_per_sqft()
+        if rate is None:
+            return None
+        return (Decimal(self.allocated_area_sqft) * rate).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
 
     def clean(self):
         super().clean()
-        if self.unit_id and self.scope_id and self.unit.scope_id != self.scope_id:
-            raise ValidationError("Unit allocation scope must match unit scope.")
+        target_field, target_obj = self._target_field_and_obj()
+        if not target_field:
+            raise ValidationError("Exactly one target must be set: site, tower, floor, or unit.")
+
+        if not self.allocation_level and target_field == "unit":
+            self.allocation_level = self.AllocationLevel.UNIT
+
+        expected_level = target_field.upper()
+        if self.allocation_level != expected_level:
+            raise ValidationError(
+                f"allocation_level must be '{expected_level}' when '{target_field}' is provided."
+            )
+
+        if self.scope_id and self.agreement_id and self.agreement.scope_id != self.scope_id:
+            raise ValidationError("Allocation scope must match agreement scope.")
+        if self.scope_id and target_obj and target_obj.scope_id != self.scope_id:
+            raise ValidationError("Allocation scope must match target scope.")
+
+        target_site_id = None
+        if self.site:
+            target_site_id = self.site_id
+        elif self.tower:
+            target_site_id = self.tower.site_id
+        elif self.floor:
+            target_site_id = self.floor.site_id
+        elif self.unit:
+            target_site_id = self.unit.floor.site_id
+
+        if self.agreement_id and target_site_id and self.agreement.site_id != target_site_id:
+            raise ValidationError("Allocation target must belong to the agreement site.")
+
+        if self.allocated_area_sqft is not None and self.allocated_area_sqft <= 0:
+            raise ValidationError("allocated_area_sqft must be greater than 0.")
+        if self.monthly_rent is not None and self.monthly_rent < 0:
+            raise ValidationError("monthly_rent must be greater than or equal to 0.")
+        if self.monthly_rent is None:
+            calculated = self._calculated_monthly_rent()
+            if calculated is not None:
+                self.monthly_rent = calculated
+
+        target_area = self._target_area()
+        if target_area is not None and self.allocated_area_sqft and self.allocated_area_sqft > target_area:
+            raise ValidationError("allocated_area_sqft cannot exceed target leasable area.")
+
+        base_qs = UnitAllocation.objects.filter(
+            is_active=True,
+            agreement__status__in=self._blocking_statuses(),
+        ).exclude(pk=self.pk)
+        if self.scope_id:
+            base_qs = base_qs.filter(scope_id=self.scope_id)
+
+        same_target_qs = base_qs.filter(**{f"{target_field}_id": getattr(self, f"{target_field}_id")})
+        existing_allocated = same_target_qs.aggregate(total=models.Sum("allocated_area_sqft"))["total"] or Decimal("0")
+        requested = self.allocated_area_sqft or Decimal("0")
+        if target_area is not None and (existing_allocated + requested) > target_area:
+            raise ValidationError("Allocation exceeds remaining target area.")
+
+        if self.unit and not self.unit.is_divisible:
+            existing_same_unit = same_target_qs
+            if existing_same_unit.exists():
+                raise ValidationError("Unit is not divisible and already has an allocation.")
+
+        # Prevent mixed parent/child allocations for the same physical branch.
+        overlap_q = models.Q()
+        if self.site:
+            overlap_q = (
+                models.Q(tower__site_id=self.site_id)
+                | models.Q(floor__site_id=self.site_id)
+                | models.Q(unit__floor__site_id=self.site_id)
+            )
+        elif self.tower:
+            overlap_q = (
+                models.Q(site_id=self.tower.site_id)
+                | models.Q(floor__tower_id=self.tower_id)
+                | models.Q(unit__floor__tower_id=self.tower_id)
+            )
+        elif self.floor:
+            overlap_q = (
+                models.Q(site_id=self.floor.site_id)
+                | models.Q(tower_id=self.floor.tower_id)
+                | models.Q(unit__floor_id=self.floor_id)
+            )
+        elif self.unit:
+            overlap_q = (
+                models.Q(site_id=self.unit.floor.site_id)
+                | models.Q(tower_id=self.unit.floor.tower_id)
+                | models.Q(floor_id=self.unit.floor_id)
+            )
+
+        if overlap_q and base_qs.filter(overlap_q).exists():
+            raise ValidationError(
+                "Overlapping parent/child allocation already exists for this target branch."
+            )
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
 
 class LeaseDocument(TenantModel):

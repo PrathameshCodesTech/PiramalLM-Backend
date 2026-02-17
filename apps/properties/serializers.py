@@ -170,11 +170,23 @@ class TowerSerializer(serializers.ModelSerializer):
             site_leasable = site.leasable_area_sqft
             if site_total is not None and new_total > site_total:
                 raise serializers.ValidationError(
-                    {"total_area_sqft": f"Sum of tower total area ({new_total}) exceeds site total built-up area ({site_total}). Remaining: {site_total - total_sum}."}
+                    {
+                        "total_area_sqft": (
+                            f"You can allocate only {site_total - total_sum:,.2f} sqft more for total area "
+                            f"in this site. You entered {total_area:,.2f} sqft. "
+                            f"Current site limit is {site_total:,.2f} sqft."
+                        )
+                    }
                 )
             if site_leasable is not None and new_leasable > site_leasable:
                 raise serializers.ValidationError(
-                    {"leasable_area_sqft": f"Sum of tower leasable area ({new_leasable}) exceeds site leasable area ({site_leasable}). Remaining: {site_leasable - leasable_sum}."}
+                    {
+                        "leasable_area_sqft": (
+                            f"You can allocate only {site_leasable - leasable_sum:,.2f} sqft more for leasable area "
+                            f"in this site. You entered {leasable_area:,.2f} sqft. "
+                            f"Current site leasable limit is {site_leasable:,.2f} sqft."
+                        )
+                    }
                 )
 
         # Tower update: prevent remaining_leasable > remaining_total with existing floors

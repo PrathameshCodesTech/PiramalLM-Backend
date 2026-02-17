@@ -99,6 +99,39 @@ def get_scopes_in_boundary(scope):
     return scope_ids
 
 
+def _get_scope_or_none(request):
+    """Returns active scope if X-Scope-ID present and valid, else None. Does not raise."""
+    from rest_framework.exceptions import PermissionDenied
+    try:
+        return get_active_scope(request)
+    except PermissionDenied:
+        return None
+
+
+def _org_company_entity_ids_for_scope(scope):
+    """
+    Return (org_ids, company_ids, entity_ids) for scope boundary filtering.
+    None in a set means no filter (show all at that level).
+    """
+    if scope is None:
+        return None, None, None
+    if scope.scope_type == models.TenantScope.ScopeType.ORG and scope.org_id:
+        return {scope.org_id}, None, None  # org + all its companies and entities
+    if scope.scope_type == models.TenantScope.ScopeType.COMPANY and scope.company_id:
+        org_id = scope.company.org_id
+        return {org_id}, {scope.company_id}, None
+    if scope.scope_type == models.TenantScope.ScopeType.ENTITY and scope.entity_id:
+        entity = scope.entity
+        return {entity.company.org_id}, {entity.company_id}, {entity.id}
+    if scope.scope_type == models.TenantScope.ScopeType.SITE and scope.site_id:
+        site = scope.site
+        entity = getattr(site, "entity", None)
+        if entity:
+            return {entity.company.org_id}, {entity.company_id}, {entity.id}
+        return None, None, None
+    return None, None, None
+
+
 # ===================== Me Endpoint =====================
 
 @api_view(["GET"])
@@ -413,6 +446,15 @@ class OrgViewSet(ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        if not self.request.user.is_superuser:
+            scope = _get_scope_or_none(self.request)
+            if scope:
+                org_ids, _, _ = _org_company_entity_ids_for_scope(scope)
+                if org_ids is not None:
+                    qs = qs.filter(id__in=org_ids)
+        org_id = self.request.query_params.get("org_id")
+        if org_id:
+            qs = qs.filter(id=org_id)
         search = self.request.query_params.get("search")
         if search:
             qs = qs.filter(Q(name__icontains=search) | Q(code__icontains=search))
@@ -426,6 +468,16 @@ class CompanyViewSet(ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset().select_related("org")
+        if not self.request.user.is_superuser:
+            scope = _get_scope_or_none(self.request)
+            if scope:
+                _, company_ids, _ = _org_company_entity_ids_for_scope(scope)
+                if company_ids is not None:
+                    qs = qs.filter(id__in=company_ids)
+                else:
+                    org_ids, _, _ = _org_company_entity_ids_for_scope(scope)
+                    if org_ids is not None:
+                        qs = qs.filter(org_id__in=org_ids)
         org_id = self.request.query_params.get("org_id")
         if org_id:
             qs = qs.filter(org_id=org_id)
@@ -442,6 +494,20 @@ class EntityViewSet(ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset().select_related("company", "company__org")
+        if not self.request.user.is_superuser:
+            scope = _get_scope_or_none(self.request)
+            if scope:
+                _, _, entity_ids = _org_company_entity_ids_for_scope(scope)
+                if entity_ids is not None:
+                    qs = qs.filter(id__in=entity_ids)
+                else:
+                    _, company_ids, _ = _org_company_entity_ids_for_scope(scope)
+                    if company_ids is not None:
+                        qs = qs.filter(company_id__in=company_ids)
+                    else:
+                        org_ids, _, _ = _org_company_entity_ids_for_scope(scope)
+                        if org_ids is not None:
+                            qs = qs.filter(company__org_id__in=org_ids)
         company_id = self.request.query_params.get("company_id")
         if company_id:
             qs = qs.filter(company_id=company_id)
@@ -557,9 +623,9 @@ class ScopeMembershipViewSet(ScopedViewSet):
     def get_queryset(self):
         qs = super().get_queryset().select_related("scope", "role", "user")
 
-        scope = get_active_scope(self.request)
-        if scope:
-            qs = qs.filter(scope=scope)
+        filter_scope_id = self.request.query_params.get("scope_id")
+        if filter_scope_id:
+            qs = qs.filter(scope_id=filter_scope_id)
 
         user_id = self.request.query_params.get("user_id")
         if user_id:
@@ -614,7 +680,7 @@ class UserViewSet(ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         qs = super().get_queryset().prefetch_related(
-            "scope_memberships", "scope_memberships__scope", "profile"
+            "scope_memberships", "scope_memberships__scope", "scope_memberships__role", "profile"
         )
 
         if not user.is_superuser:

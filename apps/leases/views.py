@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from apps.core.viewsets import ScopedViewSet, InheritableScopedViewSet
 from . import models, serializers
+from .pricing_engine import calculate_buffer_summary, resolve_base_rent_monthly
 
 
 # =============================================================================
@@ -187,7 +188,11 @@ class AgreementViewSet(ScopedViewSet):
         return queryset.select_related(
             "tenant", "site", "primary_contact"
         ).prefetch_related(
-            "unit_allocations", "unit_allocations__unit"
+            "unit_allocations",
+            "unit_allocations__site",
+            "unit_allocations__tower",
+            "unit_allocations__floor",
+            "unit_allocations__unit",
         )
 
     def perform_create(self, serializer):
@@ -221,6 +226,111 @@ class AgreementViewSet(ScopedViewSet):
         # Return updated agreement
         detail_serializer = serializers.AgreementDetailSerializer(agreement)
         return Response(detail_serializer.data)
+
+    @action(detail=True, methods=["post"], url_path="pricing-preview")
+    def pricing_preview(self, request, pk=None):
+        """Compute pricing preview (calendar-day buffer/proration) with optional unsaved overrides."""
+        agreement = self.get_object()
+        payload = request.data if isinstance(request.data, dict) else {}
+        term_dates_payload = payload.get("term_dates") if isinstance(payload.get("term_dates"), dict) else {}
+        financials_payload = payload.get("financials") if isinstance(payload.get("financials"), dict) else {}
+        rent_free_payload = payload.get("rent_free") if isinstance(payload.get("rent_free"), dict) else {}
+
+        def pick(section, key, default=None):
+            if isinstance(section, dict) and key in section:
+                return section.get(key)
+            return default
+
+        try:
+            term_dates = agreement.term_dates
+        except models.LeaseTermDates.DoesNotExist:
+            term_dates = None
+
+        try:
+            financials = agreement.financials
+        except models.LeaseFinancials.DoesNotExist:
+            financials = None
+
+        try:
+            rent_free = agreement.rent_free
+        except models.LeaseRentFree.DoesNotExist:
+            rent_free = None
+
+        commencement_date = pick(
+            term_dates_payload,
+            "commencement_date",
+            getattr(term_dates, "commencement_date", None),
+        )
+        expiry_date = pick(
+            term_dates_payload,
+            "expiry_date",
+            getattr(term_dates, "expiry_date", None),
+        )
+
+        rate_per_sqft = pick(
+            financials_payload,
+            "rate_per_sqft_monthly",
+            getattr(financials, "rate_per_sqft_monthly", None),
+        )
+        if rate_per_sqft in [None, ""] and agreement.site_id:
+            rate_per_sqft = getattr(agreement.site, "base_rate_sqft", None)
+
+        total_allocated_area = agreement.unit_allocations.filter(is_active=True).aggregate(
+            total=Sum("allocated_area_sqft")
+        )["total"] or 0
+
+        base_rent_input = pick(
+            financials_payload,
+            "base_rent_monthly",
+            getattr(financials, "base_rent_monthly", None),
+        )
+        resolved_base_rent = resolve_base_rent_monthly(
+            base_rent_input,
+            rate_per_sqft,
+            total_allocated_area,
+        )
+
+        primary_buffer_days = pick(
+            rent_free_payload,
+            "rent_free_days",
+            getattr(rent_free, "rent_free_days", 0),
+        )
+        extended_buffer_days = pick(
+            rent_free_payload,
+            "extended_buffer_days",
+            getattr(rent_free, "extended_buffer_days", 0),
+        )
+        extended_buffer_charge_percent = pick(
+            rent_free_payload,
+            "extended_buffer_charge_percent",
+            getattr(rent_free, "extended_buffer_charge_percent", 50),
+        )
+
+        summary = calculate_buffer_summary(
+            commencement_date=commencement_date,
+            expiry_date=expiry_date,
+            monthly_base_rent=resolved_base_rent,
+            primary_buffer_days=primary_buffer_days,
+            extended_buffer_days=extended_buffer_days,
+            extended_buffer_charge_percent=extended_buffer_charge_percent,
+            allocated_area_sqft=total_allocated_area,
+        )
+
+        try:
+            rate_used = float(rate_per_sqft) if rate_per_sqft not in [None, ""] else None
+        except (TypeError, ValueError):
+            rate_used = None
+
+        return Response(
+            {
+                "summary": summary,
+                "resolved": {
+                    "monthly_base_rent": float(resolved_base_rent) if resolved_base_rent is not None else None,
+                    "rate_per_sqft_monthly_used": rate_used,
+                    "total_allocated_area_sqft": float(total_allocated_area or 0),
+                },
+            }
+        )
 
     @action(detail=True, methods=["post"])
     def submit(self, request, pk=None):
@@ -280,7 +390,7 @@ class AgreementViewSet(ScopedViewSet):
 
 class UnitAllocationViewSet(ScopedViewSet):
     """
-    ViewSet for unit allocations.
+    ViewSet for granular lease allocations.
     """
 
     queryset = models.UnitAllocation.objects.all()
@@ -289,14 +399,26 @@ class UnitAllocationViewSet(ScopedViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
         agreement_id = self.request.query_params.get("agreement_id", "")
+        allocation_level = self.request.query_params.get("allocation_level", "")
+        site_id = self.request.query_params.get("site_id", "")
+        tower_id = self.request.query_params.get("tower_id", "")
+        floor_id = self.request.query_params.get("floor_id", "")
         unit_id = self.request.query_params.get("unit_id", "")
 
         if agreement_id:
             queryset = queryset.filter(agreement_id=agreement_id)
+        if allocation_level:
+            queryset = queryset.filter(allocation_level=allocation_level)
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        if tower_id:
+            queryset = queryset.filter(tower_id=tower_id)
+        if floor_id:
+            queryset = queryset.filter(floor_id=floor_id)
         if unit_id:
             queryset = queryset.filter(unit_id=unit_id)
 
-        return queryset.select_related("agreement", "unit")
+        return queryset.select_related("agreement", "site", "tower", "floor", "unit").order_by("-created_at", "-id")
 
     def perform_create(self, serializer):
         scope = self.get_active_scope()
@@ -411,19 +533,29 @@ class AvailabilityViewSet(ScopedViewSet):
             floors_data = []
             for floor in tower.floors.filter(is_active=True).order_by("number"):
                 units_data = []
+                floor_allocations = models.UnitAllocation.objects.filter(
+                    floor=floor,
+                    is_active=True,
+                    agreement__status__in=models.UnitAllocation._blocking_statuses(),
+                ).aggregate(total_allocated=Sum("allocated_area_sqft"))
+                floor_allocated = float(floor_allocations["total_allocated"] or 0)
+                floor_leasable = float(floor.leasable_area_sqft or 0)
+                floor_available = max(0, floor_leasable - floor_allocated)
+                has_floor_allocation = floor_allocated > 0
+
                 for unit in floor.units.filter(is_active=True).order_by("unit_no"):
-                    # Check active allocations
+                    # Check blocking allocations for this unit.
                     active_allocations = models.UnitAllocation.objects.filter(
                         unit=unit,
-                        agreement__status=models.Agreement.Status.ACTIVE,
-                        is_active=True
+                        is_active=True,
+                        agreement__status__in=models.UnitAllocation._blocking_statuses(),
                     ).aggregate(
                         total_allocated=Sum("allocated_area_sqft")
                     )
 
                     allocated = float(active_allocations["total_allocated"] or 0)
                     leasable = float(unit.leasable_area_sqft or 0)
-                    available = max(0, leasable - allocated)
+                    available = 0 if has_floor_allocation else max(0, leasable - allocated)
 
                     units_data.append({
                         "id": unit.id,
@@ -433,6 +565,7 @@ class AvailabilityViewSet(ScopedViewSet):
                         "builtup_area_sqft": float(unit.builtup_area_sqft or 0),
                         "allocated_area_sqft": allocated,
                         "available_area_sqft": available,
+                        "blocked_by_floor_allocation": has_floor_allocation,
                         "is_divisible": getattr(unit, "is_divisible", False),
                         "status": unit.status,
                     })
@@ -443,6 +576,9 @@ class AvailabilityViewSet(ScopedViewSet):
                     "label": floor.label,
                     "total_area_sqft": float(floor.total_area_sqft or 0),
                     "leasable_area_sqft": float(floor.leasable_area_sqft or 0),
+                    "allocated_area_sqft": floor_allocated,
+                    "available_area_sqft": floor_available,
+                    "has_floor_allocation": has_floor_allocation,
                     "units": units_data,
                 })
 
@@ -928,6 +1064,53 @@ class LeaseClauseConfigBundleView(ScopedViewSet):
     queryset = models.Agreement.objects.all()
     serializer_class = serializers.AgreementSerializer
 
+    def _build_clause_config_response(self, agreement):
+        data = {}
+
+        try:
+            data["renewal_option"] = serializers.LeaseRenewalOptionSerializer(
+                agreement.renewal_option
+            ).data
+        except models.LeaseRenewalOption.DoesNotExist:
+            data["renewal_option"] = None
+
+        try:
+            data["sublet_signage"] = serializers.LeaseSubletSignageSerializer(
+                agreement.sublet_signage
+            ).data
+        except models.LeaseSubletSignage.DoesNotExist:
+            data["sublet_signage"] = None
+
+        try:
+            data["exclusivity"] = serializers.LeaseExclusivitySerializer(
+                agreement.exclusivity
+            ).data
+        except models.LeaseExclusivity.DoesNotExist:
+            data["exclusivity"] = None
+
+        try:
+            data["insurance_requirement"] = serializers.LeaseInsuranceRequirementSerializer(
+                agreement.insurance_requirement
+            ).data
+        except models.LeaseInsuranceRequirement.DoesNotExist:
+            data["insurance_requirement"] = None
+
+        try:
+            data["dispute_resolution"] = serializers.LeaseDisputeResolutionSerializer(
+                agreement.dispute_resolution
+            ).data
+        except models.LeaseDisputeResolution.DoesNotExist:
+            data["dispute_resolution"] = None
+
+        try:
+            data["termination"] = serializers.LeaseTerminationSerializer(
+                agreement.termination
+            ).data
+        except models.LeaseTermination.DoesNotExist:
+            data["termination"] = None
+
+        return data
+
     @action(detail=True, methods=["get", "patch"], url_path="config")
     def config(self, request, pk=None):
         """Get or update all clause configurations for an agreement."""
@@ -935,52 +1118,7 @@ class LeaseClauseConfigBundleView(ScopedViewSet):
         scope = self.get_active_scope()
 
         if request.method == "GET":
-            # Return all clause configs
-            data = {}
-
-            try:
-                data["renewal_option"] = serializers.LeaseRenewalOptionSerializer(
-                    agreement.renewal_option
-                ).data
-            except models.LeaseRenewalOption.DoesNotExist:
-                data["renewal_option"] = None
-
-            try:
-                data["sublet_signage"] = serializers.LeaseSubletSignageSerializer(
-                    agreement.sublet_signage
-                ).data
-            except models.LeaseSubletSignage.DoesNotExist:
-                data["sublet_signage"] = None
-
-            try:
-                data["exclusivity"] = serializers.LeaseExclusivitySerializer(
-                    agreement.exclusivity
-                ).data
-            except models.LeaseExclusivity.DoesNotExist:
-                data["exclusivity"] = None
-
-            try:
-                data["insurance_requirement"] = serializers.LeaseInsuranceRequirementSerializer(
-                    agreement.insurance_requirement
-                ).data
-            except models.LeaseInsuranceRequirement.DoesNotExist:
-                data["insurance_requirement"] = None
-
-            try:
-                data["dispute_resolution"] = serializers.LeaseDisputeResolutionSerializer(
-                    agreement.dispute_resolution
-                ).data
-            except models.LeaseDisputeResolution.DoesNotExist:
-                data["dispute_resolution"] = None
-
-            try:
-                data["termination"] = serializers.LeaseTerminationSerializer(
-                    agreement.termination
-                ).data
-            except models.LeaseTermination.DoesNotExist:
-                data["termination"] = None
-
-            return Response(data)
+            return Response(self._build_clause_config_response(agreement))
 
         else:  # PATCH
             # Update clause configs
@@ -1005,4 +1143,4 @@ class LeaseClauseConfigBundleView(ScopedViewSet):
                     )
 
             # Return updated configs
-            return self.config(request._request, pk=pk)
+            return Response(self._build_clause_config_response(agreement))

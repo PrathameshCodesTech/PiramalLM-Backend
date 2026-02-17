@@ -947,6 +947,8 @@ class PaymentViewSet(ScopedViewSet):
             return serializers.PaymentListSerializer
         if self.action == "retrieve":
             return serializers.PaymentDetailSerializer
+        if self.action == "create":
+            return serializers.PaymentCreateSerializer
         return serializers.PaymentSerializer
 
     def get_queryset(self):
@@ -1036,6 +1038,8 @@ class CreditNoteViewSet(ScopedViewSet):
             return serializers.CreditNoteListSerializer
         if self.action == "retrieve":
             return serializers.CreditNoteDetailSerializer
+        if self.action == "create":
+            return serializers.CreditNoteCreateSerializer
         return serializers.CreditNoteSerializer
 
     def get_queryset(self):
@@ -1152,14 +1156,44 @@ class InvoiceScheduleViewSet(ScopedViewSet):
     def perform_update(self, serializer):
         serializer.save(updated_by=self.request.user)
 
+    def _get_invoice_number_and_due_date(self, schedule):
+        """Resolve invoice number from site config and due_date from payment terms."""
+        from datetime import timedelta
+
+        today = timezone.now().date()
+        invoice_number = f"INV-{today.strftime('%Y%m%d')}-{schedule.id}"
+        due_date = today
+
+        site = getattr(schedule.agreement, "site", None)
+        if site:
+            try:
+                config = models.SiteBillingConfig.objects.get(site=site, scope=schedule.scope)
+                invoice_number = config.get_next_invoice_number()
+                term_days = {
+                    "DUE_ON_RECEIPT": 0,
+                    "NET_7": 7,
+                    "NET_15": 15,
+                    "NET_30": 30,
+                    "NET_45": 45,
+                    "NET_60": 60,
+                }
+                days = term_days.get(config.default_payment_term, 30)
+                due_date = today + timedelta(days=days)
+            except models.SiteBillingConfig.DoesNotExist:
+                pass
+
+        return invoice_number, due_date
+
     @action(detail=True, methods=["post"])
     def generate(self, request, pk=None):
         """Generate invoice from schedule immediately."""
         schedule = self.get_object()
 
-        # Create invoice based on schedule
-        invoice_number = f"INV-{timezone.now().strftime('%Y%m%d')}-{schedule.id}"
         today = timezone.now().date()
+        invoice_number, due_date = self._get_invoice_number_and_due_date(schedule)
+
+        tax_amt = schedule.amount * (schedule.tax_rate / 100)
+        total = schedule.amount + tax_amt
 
         invoice = models.Invoice.objects.create(
             scope=schedule.scope,
@@ -1168,16 +1202,15 @@ class InvoiceScheduleViewSet(ScopedViewSet):
             invoice_type=schedule.invoice_type,
             status=models.Invoice.InvoiceStatus.PENDING,
             invoice_date=today,
-            due_date=today,  # Adjust based on billing rules
+            due_date=due_date,
             subtotal=schedule.amount,
-            tax_amount=schedule.amount * (schedule.tax_rate / 100),
-            total_amount=schedule.amount + (schedule.amount * (schedule.tax_rate / 100)),
+            tax_amount=tax_amt,
+            total_amount=total,
             amount_paid=Decimal("0"),
-            balance_due=schedule.amount + (schedule.amount * (schedule.tax_rate / 100)),
+            balance_due=total,
             created_by=request.user,
         )
 
-        # Update schedule
         schedule.last_generated_date = today
         schedule.save()
 

@@ -60,16 +60,24 @@ class SiteAmenityViewSet(ScopedViewSet):
 
     def get_queryset(self):
         scope = get_active_scope(self.request)
-        return super().get_queryset().filter(site__scope=scope)
+        scope_ids = list(scope.get_child_scopes().values_list("id", flat=True))
+        queryset = self.queryset.filter(site__scope_id__in=scope_ids)
+        site_id = self.request.query_params.get("site")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        return queryset
 
     def perform_create(self, serializer):
         scope = get_active_scope(self.request)
+        scope_ids = set(scope.get_child_scopes().values_list("id", flat=True))
         site = serializer.validated_data.get("site")
         amenity = serializer.validated_data.get("amenity")
-        if site and site.scope_id != scope.id:
-            raise ValidationError("Site must belong to the active scope.")
-        if amenity and amenity.scope_id != scope.id:
-            raise ValidationError("Amenity must belong to the active scope.")
+        if site and site.scope_id not in scope_ids:
+            raise ValidationError("Site must belong to active scope or child scope.")
+        if amenity and amenity.scope_id not in scope_ids:
+            raise ValidationError("Amenity must belong to active scope or child scope.")
+        if site and amenity and site.scope_id != amenity.scope_id:
+            raise ValidationError("Site and amenity must belong to the same scope.")
         serializer.save()
 
     def perform_update(self, serializer):
@@ -80,20 +88,57 @@ class TowerViewSet(ScopedViewSet):
     queryset = models.Tower.objects.all().order_by("id")
     serializer_class = serializers.TowerSerializer
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        site_id = self.request.query_params.get("site") or self.request.query_params.get("site_id")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        return queryset
+
 
 class FloorViewSet(ScopedViewSet):
     queryset = models.Floor.objects.all()
     serializer_class = serializers.FloorSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        site_id = self.request.query_params.get("site") or self.request.query_params.get("site_id")
+        tower_id = self.request.query_params.get("tower") or self.request.query_params.get("tower_id")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        if tower_id:
+            queryset = queryset.filter(tower_id=tower_id)
+        return queryset
 
 
 class UnitViewSet(ScopedViewSet):
     queryset = models.Unit.objects.all()
     serializer_class = serializers.UnitSerializer
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        site_id = self.request.query_params.get("site") or self.request.query_params.get("site_id")
+        tower_id = self.request.query_params.get("tower") or self.request.query_params.get("tower_id")
+        floor_id = self.request.query_params.get("floor") or self.request.query_params.get("floor_id")
+        if site_id:
+            queryset = queryset.filter(floor__site_id=site_id)
+        if tower_id:
+            queryset = queryset.filter(floor__tower_id=tower_id)
+        if floor_id:
+            queryset = queryset.filter(floor_id=floor_id)
+        return queryset
+
 
 class UnitAreaReservationViewSet(ScopedViewSet):
     queryset = models.UnitAreaReservation.objects.all()
     serializer_class = serializers.UnitAreaReservationSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        unit_id = self.request.query_params.get("unit") or self.request.query_params.get("unit_id")
+        if unit_id:
+            queryset = queryset.filter(unit_id=unit_id)
+        return queryset
 
 
 class UnitAmenityViewSet(ScopedViewSet):
@@ -102,16 +147,24 @@ class UnitAmenityViewSet(ScopedViewSet):
 
     def get_queryset(self):
         scope = get_active_scope(self.request)
-        return super().get_queryset().filter(unit__scope=scope)
+        scope_ids = list(scope.get_child_scopes().values_list("id", flat=True))
+        queryset = self.queryset.filter(unit__scope_id__in=scope_ids)
+        unit_id = self.request.query_params.get("unit")
+        if unit_id:
+            queryset = queryset.filter(unit_id=unit_id)
+        return queryset
 
     def perform_create(self, serializer):
         scope = get_active_scope(self.request)
+        scope_ids = set(scope.get_child_scopes().values_list("id", flat=True))
         unit = serializer.validated_data.get("unit")
         amenity = serializer.validated_data.get("amenity")
-        if unit and unit.scope_id != scope.id:
-            raise ValidationError("Unit must belong to the active scope.")
-        if amenity and amenity.scope_id != scope.id:
-            raise ValidationError("Amenity must belong to the active scope.")
+        if unit and unit.scope_id not in scope_ids:
+            raise ValidationError("Unit must belong to active scope or child scope.")
+        if amenity and amenity.scope_id not in scope_ids:
+            raise ValidationError("Amenity must belong to active scope or child scope.")
+        if unit and amenity and unit.scope_id != amenity.scope_id:
+            raise ValidationError("Unit and amenity must belong to the same scope.")
         serializer.save()
 
     def perform_update(self, serializer):
@@ -132,10 +185,24 @@ class AssetItemViewSet(ScopedViewSet):
     queryset = models.AssetItem.objects.all()
     serializer_class = serializers.AssetItemSerializer
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        category_id = self.request.query_params.get("category") or self.request.query_params.get("category_id")
+        if category_id:
+            queryset = queryset.filter(category_id=category_id)
+        return queryset
+
 
 class UnitAssetViewSet(ScopedViewSet):
     queryset = models.UnitAsset.objects.all()
     serializer_class = serializers.UnitAssetSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        unit_id = self.request.query_params.get("unit") or self.request.query_params.get("unit_id")
+        if unit_id:
+            queryset = queryset.filter(unit_id=unit_id)
+        return queryset
 
 
 class FormTemplateViewSet(ScopedViewSet):

@@ -150,6 +150,7 @@ class InvoiceDetailSerializer(serializers.ModelSerializer):
 class InvoiceCreateSerializer(serializers.ModelSerializer):
     """For creating invoices with line items."""
     line_items = InvoiceLineItemCreateSerializer(many=True, required=False)
+    invoice_number = serializers.CharField(required=False, allow_blank=True)
 
     class Meta:
         model = models.Invoice
@@ -162,6 +163,23 @@ class InvoiceCreateSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         line_items_data = validated_data.pop("line_items", [])
+        invoice_number = validated_data.get("invoice_number", "").strip()
+        if not invoice_number:
+            agreement = validated_data.get("agreement")
+            scope = validated_data.get("scope")
+            if agreement and scope and hasattr(agreement, "site") and agreement.site:
+                try:
+                    config = models.SiteBillingConfig.objects.get(site=agreement.site, scope=scope)
+                    invoice_number = config.get_next_invoice_number()
+                except models.SiteBillingConfig.DoesNotExist:
+                    pass
+            if not invoice_number:
+                from django.utils import timezone
+                if scope:
+                    invoice_number = f"INV-{timezone.now().strftime('%Y%m%d')}-{models.Invoice.objects.filter(scope=scope).count() + 1}"
+                else:
+                    invoice_number = f"INV-{timezone.now().strftime('%Y%m%d%H%M%S')}"
+            validated_data["invoice_number"] = invoice_number
         invoice = models.Invoice.objects.create(**validated_data)
 
         for item_data in line_items_data:
@@ -195,6 +213,33 @@ class PaymentSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+
+
+class PaymentCreateSerializer(serializers.ModelSerializer):
+    """For creating payments; auto-generates payment_number when empty."""
+    payment_number = serializers.CharField(required=False, allow_blank=True)
+
+    class Meta:
+        model = models.Payment
+        fields = (
+            "invoice", "payment_number", "payment_date", "amount",
+            "payment_method", "status", "reference_number",
+            "bank_name", "cheque_number", "transaction_id", "notes", "currency"
+        )
+
+    def create(self, validated_data):
+        payment_number = validated_data.get("payment_number", "").strip()
+        if not payment_number:
+            scope = validated_data.get("scope")
+            if scope:
+                from django.utils import timezone
+                cnt = models.Payment.objects.filter(scope=scope).count() + 1
+                payment_number = f"PAY-{timezone.now().strftime('%Y%m%d')}-{cnt}"
+            else:
+                from django.utils import timezone
+                payment_number = f"PAY-{timezone.now().strftime('%Y%m%d%H%M%S')}"
+            validated_data["payment_number"] = payment_number
+        return models.Payment.objects.create(**validated_data)
 
 
 class PaymentDetailSerializer(serializers.ModelSerializer):
@@ -241,6 +286,32 @@ class CreditNoteSerializer(serializers.ModelSerializer):
         )
 
 
+class CreditNoteCreateSerializer(serializers.ModelSerializer):
+    """For creating credit notes; auto-generates credit_note_number when empty."""
+    credit_note_number = serializers.CharField(required=False, allow_blank=True)
+
+    class Meta:
+        model = models.CreditNote
+        fields = (
+            "invoice", "credit_note_number", "credit_note_date", "amount",
+            "reason", "reason_details", "status"
+        )
+
+    def create(self, validated_data):
+        credit_note_number = validated_data.get("credit_note_number", "").strip()
+        if not credit_note_number:
+            scope = validated_data.get("scope")
+            if scope:
+                from django.utils import timezone
+                cnt = models.CreditNote.objects.filter(scope=scope).count() + 1
+                credit_note_number = f"CN-{timezone.now().strftime('%Y%m%d')}-{cnt}"
+            else:
+                from django.utils import timezone
+                credit_note_number = f"CN-{timezone.now().strftime('%Y%m%d%H%M%S')}"
+            validated_data["credit_note_number"] = credit_note_number
+        return models.CreditNote.objects.create(**validated_data)
+
+
 class CreditNoteDetailSerializer(serializers.ModelSerializer):
     """Full detail serializer with invoice details."""
     invoice_details = serializers.SerializerMethodField()
@@ -270,6 +341,8 @@ class CreditNoteDetailSerializer(serializers.ModelSerializer):
 # ===================== Invoice Schedule Serializers =====================
 
 class InvoiceScheduleSerializer(serializers.ModelSerializer):
+    agreement_lease_id = serializers.CharField(source="agreement.lease_id", read_only=True)
+
     class Meta:
         model = models.InvoiceSchedule
         fields = "__all__"

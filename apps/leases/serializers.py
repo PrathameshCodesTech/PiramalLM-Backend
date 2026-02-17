@@ -1,3 +1,7 @@
+from datetime import timedelta
+from decimal import Decimal, ROUND_HALF_UP
+
+from django.db.models import Sum
 from rest_framework import serializers
 from apps.tenants.serializers import TenantCompanyListSerializer, TenantContactSerializer
 from . import models
@@ -23,7 +27,11 @@ class EscalationTemplateListSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.EscalationTemplate
         fields = (
-            "id", "name", "description", "escalation_type", "frequency",
+            "id", "name", "description", "escalation_type",
+            "escalation_percentage", "index_name", "index_base_value", "step_schedule",
+            "frequency", "first_escalation_months",
+            "cap_percentage", "floor_percentage",
+            "apply_to_cam", "apply_to_parking",
             "status", "applicability", "scope", "created_at"
         )
 
@@ -46,9 +54,33 @@ class LeaseTermDatesSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+        extra_kwargs = {
+            "agreement": {"required": False},
+        }
 
 
 class LeaseRentFreeSerializer(serializers.ModelSerializer):
+    def validate(self, attrs):
+        start_date = attrs.get("rent_free_start_date")
+        rent_free_days = attrs.get("rent_free_days")
+        extended_days = attrs.get("extended_buffer_days")
+        extended_percent = attrs.get("extended_buffer_charge_percent")
+
+        if start_date is None and self.instance is not None:
+            start_date = self.instance.rent_free_start_date
+        if rent_free_days is None and self.instance is not None:
+            rent_free_days = self.instance.rent_free_days
+
+        if start_date and rent_free_days:
+            attrs["rent_free_end_date"] = start_date + timedelta(days=int(rent_free_days) - 1)
+        elif "rent_free_days" in attrs and not rent_free_days:
+            attrs["rent_free_end_date"] = None
+
+        if extended_days and extended_percent in [None, ""]:
+            attrs["extended_buffer_charge_percent"] = Decimal("50.00")
+
+        return attrs
+
     class Meta:
         model = models.LeaseRentFree
         fields = "__all__"
@@ -56,9 +88,21 @@ class LeaseRentFreeSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+        extra_kwargs = {
+            "agreement": {"required": False},
+        }
 
 
 class LeaseFinancialsSerializer(serializers.ModelSerializer):
+    def validate(self, attrs):
+        base_rent = attrs.get("base_rent_monthly")
+        if base_rent not in [None, ""]:
+            attrs["annual_rent"] = (Decimal(base_rent) * Decimal("12")).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+        return attrs
+
     class Meta:
         model = models.LeaseFinancials
         fields = "__all__"
@@ -66,9 +110,69 @@ class LeaseFinancialsSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+        extra_kwargs = {
+            "agreement": {"required": False},
+        }
 
 
 class LeaseEscalationSerializer(serializers.ModelSerializer):
+    TEMPLATE_TYPE_TO_LEASE_TYPE = {
+        models.EscalationTemplate.EscalationType.FIXED_PERCENT: models.LeaseEscalation.EscalationType.FIXED_PERCENT,
+        models.EscalationTemplate.EscalationType.INDEX_LINKED: models.LeaseEscalation.EscalationType.CPI_INDEX,
+        models.EscalationTemplate.EscalationType.STEP_WISE: models.LeaseEscalation.EscalationType.STEP_UP,
+    }
+    TEMPLATE_FREQUENCY_TO_MONTHS = {
+        models.EscalationTemplate.Frequency.ANNUAL: 12,
+        models.EscalationTemplate.Frequency.EVERY_2_YEARS: 24,
+        models.EscalationTemplate.Frequency.EVERY_3_YEARS: 36,
+        models.EscalationTemplate.Frequency.EVERY_5_YEARS: 60,
+    }
+
+    def _apply_template_values(self, attrs, template):
+        attrs["use_template_values"] = True
+        attrs["escalation_type"] = self.TEMPLATE_TYPE_TO_LEASE_TYPE.get(
+            template.escalation_type,
+            models.LeaseEscalation.EscalationType.FIXED_PERCENT,
+        )
+        attrs["escalation_value"] = template.escalation_percentage
+        attrs["escalation_frequency_months"] = self.TEMPLATE_FREQUENCY_TO_MONTHS.get(
+            template.frequency,
+            12,
+        )
+        attrs["first_escalation_months"] = template.first_escalation_months
+        attrs["apply_to_cam"] = template.apply_to_cam
+        attrs["apply_to_parking"] = template.apply_to_parking
+        attrs["cap_percentage"] = template.cap_percentage
+        attrs["floor_percentage"] = template.floor_percentage
+
+        if template.escalation_type == models.EscalationTemplate.EscalationType.INDEX_LINKED:
+            attrs["index_name"] = template.index_name
+            attrs["index_base_value"] = template.index_base_value
+        if template.escalation_type == models.EscalationTemplate.EscalationType.STEP_WISE:
+            attrs["step_schedule"] = template.step_schedule
+
+    def validate(self, attrs):
+        template = attrs.get("template")
+        use_template_values = attrs.get("use_template_values")
+
+        if template is None and self.instance is not None:
+            template = self.instance.template
+        if use_template_values is None and self.instance is not None:
+            use_template_values = self.instance.use_template_values
+
+        # If a template is selected in payload, prefer template-driven values.
+        if attrs.get("template") is not None:
+            self._apply_template_values(attrs, attrs["template"])
+            return attrs
+
+        if use_template_values and template is None:
+            raise serializers.ValidationError({"template": "Template is required when using template values."})
+
+        if use_template_values and template is not None:
+            self._apply_template_values(attrs, template)
+
+        return attrs
+
     class Meta:
         model = models.LeaseEscalation
         fields = "__all__"
@@ -76,6 +180,9 @@ class LeaseEscalationSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+        extra_kwargs = {
+            "agreement": {"required": False},
+        }
 
 
 class LeaseCAMSerializer(serializers.ModelSerializer):
@@ -86,6 +193,9 @@ class LeaseCAMSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+        extra_kwargs = {
+            "agreement": {"required": False},
+        }
 
 
 class LeaseDepositSerializer(serializers.ModelSerializer):
@@ -96,6 +206,9 @@ class LeaseDepositSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+        extra_kwargs = {
+            "agreement": {"required": False},
+        }
 
 
 class LeaseBillingSerializer(serializers.ModelSerializer):
@@ -106,6 +219,9 @@ class LeaseBillingSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+        extra_kwargs = {
+            "agreement": {"required": False},
+        }
 
 
 class LeaseTerminationSerializer(serializers.ModelSerializer):
@@ -119,6 +235,9 @@ class LeaseTerminationSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+        extra_kwargs = {
+            "agreement": {"required": False},
+        }
 
     def get_tenant_penalty_display(self, obj):
         return obj.get_tenant_penalty_display()
@@ -380,6 +499,11 @@ class LeaseLinkedDocumentDetailSerializer(serializers.ModelSerializer):
 # ===================== Allocation Serializers =====================
 
 class UnitAllocationSerializer(serializers.ModelSerializer):
+    target_type = serializers.SerializerMethodField()
+    target_details = serializers.SerializerMethodField()
+    site_details = serializers.SerializerMethodField()
+    tower_details = serializers.SerializerMethodField()
+    floor_details = serializers.SerializerMethodField()
     unit_details = serializers.SerializerMethodField()
 
     class Meta:
@@ -401,11 +525,65 @@ class UnitAllocationSerializer(serializers.ModelSerializer):
             }
         return None
 
+    def get_site_details(self, obj):
+        if obj.site:
+            return {
+                "id": obj.site.id,
+                "name": obj.site.name,
+                "code": obj.site.code,
+                "leasable_area_sqft": obj.site.leasable_area_sqft,
+            }
+        return None
+
+    def get_tower_details(self, obj):
+        if obj.tower:
+            return {
+                "id": obj.tower.id,
+                "name": obj.tower.name,
+                "code": obj.tower.code,
+                "site_id": obj.tower.site_id,
+                "leasable_area_sqft": obj.tower.leasable_area_sqft,
+            }
+        return None
+
+    def get_floor_details(self, obj):
+        if obj.floor:
+            return {
+                "id": obj.floor.id,
+                "number": obj.floor.number,
+                "label": obj.floor.label,
+                "tower_id": obj.floor.tower_id,
+                "site_id": obj.floor.site_id,
+                "leasable_area_sqft": obj.floor.leasable_area_sqft,
+            }
+        return None
+
+    def get_target_type(self, obj):
+        return obj.allocation_level
+
+    def get_target_details(self, obj):
+        if obj.allocation_level == models.UnitAllocation.AllocationLevel.SITE:
+            return self.get_site_details(obj)
+        if obj.allocation_level == models.UnitAllocation.AllocationLevel.TOWER:
+            return self.get_tower_details(obj)
+        if obj.allocation_level == models.UnitAllocation.AllocationLevel.FLOOR:
+            return self.get_floor_details(obj)
+        return self.get_unit_details(obj)
+
 
 class UnitAllocationCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.UnitAllocation
-        fields = ("unit", "allocation_mode", "allocated_area_sqft", "monthly_rent")
+        fields = (
+            "allocation_level",
+            "site",
+            "tower",
+            "floor",
+            "unit",
+            "allocation_mode",
+            "allocated_area_sqft",
+            "monthly_rent",
+        )
 
 
 # ===================== Document & Note Serializers =====================
@@ -465,14 +643,25 @@ class AgreementListSerializer(serializers.ModelSerializer):
     def get_total_allocated_area(self, obj):
         return sum(
             alloc.allocated_area_sqft or 0
-            for alloc in obj.unit_allocations.all()
+            for alloc in obj.unit_allocations.filter(is_active=True)
         )
 
     def get_monthly_rent(self, obj):
         try:
-            return obj.financials.base_rent_monthly
+            financials = obj.financials
         except models.LeaseFinancials.DoesNotExist:
             return None
+        if financials.base_rent_monthly is not None:
+            return financials.base_rent_monthly
+        if financials.rate_per_sqft_monthly is None:
+            return None
+        total_area = obj.unit_allocations.filter(is_active=True).aggregate(
+            total=Sum("allocated_area_sqft")
+        )["total"] or Decimal("0")
+        return (Decimal(total_area) * Decimal(financials.rate_per_sqft_monthly)).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
 
 
 class AgreementSerializer(serializers.ModelSerializer):
@@ -545,12 +734,26 @@ class AgreementDetailSerializer(serializers.ModelSerializer):
     def get_total_allocated_area(self, obj):
         return sum(
             float(alloc.allocated_area_sqft or 0)
-            for alloc in obj.unit_allocations.all()
+            for alloc in obj.unit_allocations.filter(is_active=True)
         )
 
     def get_total_monthly_rent(self, obj):
         try:
-            base = float(obj.financials.base_rent_monthly or 0)
+            financials = obj.financials
+            if financials.base_rent_monthly is not None:
+                base = float(financials.base_rent_monthly or 0)
+            elif financials.rate_per_sqft_monthly is not None:
+                total_area = obj.unit_allocations.filter(is_active=True).aggregate(
+                    total=Sum("allocated_area_sqft")
+                )["total"] or Decimal("0")
+                base = float(
+                    (Decimal(total_area) * Decimal(financials.rate_per_sqft_monthly)).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_HALF_UP,
+                    )
+                )
+            else:
+                base = 0
             cam = float(obj.cam.monthly_total or 0) if hasattr(obj, "cam") else 0
             return base + cam
         except (models.LeaseFinancials.DoesNotExist, models.LeaseCAM.DoesNotExist):
@@ -662,8 +865,40 @@ class LeaseTermsBundleSerializer(serializers.Serializer):
             )
 
         if "financials" in data:
+            financials_data = dict(data["financials"])
+            if (
+                financials_data.get("base_rent_monthly") in [None, ""]
+                and financials_data.get("rate_per_sqft_monthly") not in [None, ""]
+            ):
+                total_area = agreement.unit_allocations.filter(is_active=True).aggregate(
+                    total=Sum("allocated_area_sqft")
+                )["total"] or Decimal("0")
+                if total_area > 0:
+                    financials_data["base_rent_monthly"] = (
+                        Decimal(total_area) * Decimal(financials_data["rate_per_sqft_monthly"])
+                    ).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_HALF_UP,
+                    )
+
+            effective_base = financials_data.get("base_rent_monthly")
+            if effective_base in [None, ""]:
+                try:
+                    existing_financials = agreement.financials
+                    effective_base = existing_financials.base_rent_monthly
+                except models.LeaseFinancials.DoesNotExist:
+                    effective_base = None
+
+            if effective_base not in [None, ""]:
+                financials_data["annual_rent"] = (
+                    Decimal(effective_base) * Decimal("12")
+                ).quantize(
+                    Decimal("0.01"),
+                    rounding=ROUND_HALF_UP,
+                )
+
             self.update_or_create_term(
-                agreement, models.LeaseFinancials, data["financials"], scope, user
+                agreement, models.LeaseFinancials, financials_data, scope, user
             )
 
         if "escalation" in data:

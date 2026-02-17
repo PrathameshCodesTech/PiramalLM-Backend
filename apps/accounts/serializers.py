@@ -185,16 +185,18 @@ class UserSerializer(serializers.ModelSerializer):
 
 
 class UserListSerializer(serializers.ModelSerializer):
-    """User list with memberships count."""
+    """User list with memberships count and scope info."""
     role = serializers.SerializerMethodField()
     memberships_count = serializers.SerializerMethodField()
     full_name = serializers.SerializerMethodField()
+    memberships = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = (
             "id", "username", "email", "first_name", "last_name",
-            "is_active", "role", "memberships_count", "full_name"
+            "is_active", "role", "memberships_count", "full_name",
+            "memberships",
         )
 
     def get_role(self, obj):
@@ -206,6 +208,17 @@ class UserListSerializer(serializers.ModelSerializer):
 
     def get_full_name(self, obj):
         return obj.get_full_name() or obj.username
+
+    def get_memberships(self, obj):
+        return [
+            {
+                "scope_id": m.scope_id,
+                "scope_name": m.scope.name,
+                "scope_type": m.scope.scope_type,
+                "role_name": m.role.name,
+            }
+            for m in obj.scope_memberships.filter(is_active=True).select_related("scope", "role")
+        ]
 
 
 class UserDetailSerializer(serializers.ModelSerializer):
