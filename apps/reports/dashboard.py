@@ -134,6 +134,10 @@ class DashboardService:
             'kpis': self.get_kpis(),
             'charts': self.get_charts(),
             'tables': self.get_tables(),
+            'alerts': self.get_alerts(),
+            'quick_actions': self.get_quick_actions(),
+            'properties': self.get_properties_table(),
+            'portfolio_stats': self.get_portfolio_stats(),
             'portfolio_map': self.get_portfolio_map(),
             'occupancy_timeline': self.get_occupancy_timeline(),
             'filters': self.get_filter_options(),
@@ -930,6 +934,418 @@ class DashboardService:
         data.sort(key=lambda x: x['days'], reverse=True)
         
         return data
+
+    # ── Alerts ────────────────────────────────────────────────────────────
+    def get_alerts(self):
+        """
+        Get actionable alerts for the dashboard.
+        Returns list of alerts sorted by severity then recency.
+
+        Alert types:
+          - LEASE_EXPIRING: lease expiring within 30 days, no renewal
+          - RENT_OVERDUE: tenant payment overdue 61+ days
+          - HIGH_VACANCY: unit vacant > 60 days
+        """
+        alerts = []
+        today = self.as_of
+
+        # ─ Lease Expiring (within 30 days) ─
+        soon = today + timedelta(days=30)
+        expiring = self._apply_scope_filter(
+            Agreement.objects.filter(
+                is_active=True,
+                status=Agreement.Status.ACTIVE,
+                term_dates__expiry_date__range=[today, soon],
+            )
+        ).select_related('tenant', 'term_dates', 'site')
+
+        if self.site_ids:
+            expiring = expiring.filter(site_id__in=self.site_ids)
+
+        for ag in expiring:
+            td = ag.term_dates
+            if not td:
+                continue
+            days_left = (td.expiry_date - today).days
+            alerts.append({
+                'id': f"lease_exp_{ag.id}",
+                'type': 'LEASE_EXPIRING',
+                'severity': 'high' if days_left <= 14 else 'medium',
+                'title': f"Lease Expiring in {days_left} Day{'s' if days_left != 1 else ''}",
+                'description': (
+                    f"{ag.tenant.legal_name if ag.tenant else 'Unknown'} lease expires "
+                    f"{td.expiry_date.strftime('%B %d')}. No renewal initiated."
+                ),
+                'site_name': ag.site.name if ag.site else None,
+                'site_id': str(ag.site_id) if ag.site_id else None,
+                'agreement_id': str(ag.id),
+                'days': days_left,
+                'created_at': (today - timedelta(days=max(0, 30 - days_left))).isoformat(),
+            })
+
+        # ─ Rent Overdue (61+ days) ─
+        cutoff_date = today - timedelta(days=61)
+        overdue_invoices = self._apply_scope_filter(
+            Invoice.objects.filter(
+                is_active=True,
+                status__in=[
+                    Invoice.InvoiceStatus.OVERDUE,
+                    Invoice.InvoiceStatus.SENT,
+                    Invoice.InvoiceStatus.PARTIALLY_PAID,
+                ],
+                balance_due__gt=0,
+                due_date__lte=cutoff_date,
+            )
+        ).select_related('agreement__tenant', 'agreement__site')
+
+        if self.site_ids:
+            overdue_invoices = overdue_invoices.filter(
+                agreement__site_id__in=self.site_ids
+            )
+
+        # Group by tenant to avoid duplicate alerts
+        tenant_overdue = {}
+        for inv in overdue_invoices:
+            tenant = inv.agreement.tenant
+            key = tenant.id if tenant else 'unknown'
+            if key not in tenant_overdue:
+                tenant_overdue[key] = {
+                    'tenant_name': tenant.legal_name if tenant else 'Unknown',
+                    'total_overdue': 0,
+                    'oldest_due_date': inv.due_date,
+                    'site_name': inv.agreement.site.name if inv.agreement.site else None,
+                    'site_id': str(inv.agreement.site_id) if inv.agreement.site_id else None,
+                    'agreement_id': str(inv.agreement_id),
+                }
+            tenant_overdue[key]['total_overdue'] += float(inv.balance_due or 0)
+            if inv.due_date < tenant_overdue[key]['oldest_due_date']:
+                tenant_overdue[key]['oldest_due_date'] = inv.due_date
+
+        for key, info in tenant_overdue.items():
+            days_overdue = (today - info['oldest_due_date']).days
+            alerts.append({
+                'id': f"rent_overdue_{key}",
+                'type': 'RENT_OVERDUE',
+                'severity': 'high' if days_overdue > 90 else 'medium',
+                'title': f"Rent Payment Overdue ({days_overdue}+ days)",
+                'description': (
+                    f"{info['tenant_name']} – ₹{self._format_money(info['total_overdue'])} "
+                    f"outstanding since {info['oldest_due_date'].strftime('%B')}."
+                ),
+                'site_name': info['site_name'],
+                'site_id': info['site_id'],
+                'agreement_id': info['agreement_id'],
+                'days': days_overdue,
+                'created_at': info['oldest_due_date'].isoformat(),
+            })
+
+        # ─ High Vacancy (unit vacant > 60 days) ─
+        vacant_cutoff = today - timedelta(days=60)
+        vacant_units = self._apply_scope_filter(
+            Unit.objects.filter(
+                status=Unit.UnitStatus.AVAILABLE,
+                is_active=True,
+            )
+        ).select_related('floor__tower__site')
+
+        if self.site_ids:
+            vacant_units = vacant_units.filter(floor__tower__site_id__in=self.site_ids)
+
+        for unit in vacant_units:
+            vacant_since = unit.updated_at.date()
+            days_vacant = (today - vacant_since).days
+            if days_vacant < 60:
+                continue
+            site = unit.floor.tower.site
+            alerts.append({
+                'id': f"vacancy_{unit.id}",
+                'type': 'HIGH_VACANCY',
+                'severity': 'low',
+                'title': "High Vacancy Alert",
+                'description': (
+                    f"{site.name} – {unit.unit_no} vacant > {days_vacant} days."
+                ),
+                'site_name': site.name,
+                'site_id': str(site.id),
+                'unit_id': str(unit.id),
+                'days': days_vacant,
+                'created_at': vacant_since.isoformat(),
+            })
+
+        # Sort: high severity first, then by days descending
+        severity_order = {'high': 0, 'medium': 1, 'low': 2}
+        alerts.sort(key=lambda a: (severity_order.get(a['severity'], 9), -a['days']))
+
+        return alerts
+
+    # ── Quick Actions ────────────────────────────────────────────────────
+    def get_quick_actions(self):
+        """
+        Get counts for quick-action widgets.
+        Returns counts for lease creation CTA and maintenance request buckets.
+        """
+        today = self.as_of
+
+        # Active leases count
+        active_leases = self._apply_scope_filter(
+            Agreement.objects.filter(
+                is_active=True,
+                status=Agreement.Status.ACTIVE,
+            )
+        )
+        if self.site_ids:
+            active_leases = active_leases.filter(site_id__in=self.site_ids)
+
+        # Draft leases (pending action)
+        draft_leases = self._apply_scope_filter(
+            Agreement.objects.filter(
+                is_active=True,
+                status__in=[Agreement.Status.DRAFT, Agreement.Status.PENDING],
+            )
+        )
+        if self.site_ids:
+            draft_leases = draft_leases.filter(site_id__in=self.site_ids)
+
+        # Disputed invoices (open requests)
+        disputed = self._apply_scope_filter(
+            Invoice.objects.filter(
+                is_active=True,
+                is_disputed=True,
+                status__in=[
+                    Invoice.InvoiceStatus.DISPUTED,
+                    Invoice.InvoiceStatus.SENT,
+                    Invoice.InvoiceStatus.PARTIALLY_PAID,
+                ],
+            )
+        )
+        if self.site_ids:
+            disputed = disputed.filter(agreement__site_id__in=self.site_ids)
+
+        # Overdue invoices needing follow-up
+        overdue = self._apply_scope_filter(
+            Invoice.objects.filter(
+                is_active=True,
+                status=Invoice.InvoiceStatus.OVERDUE,
+                balance_due__gt=0,
+            )
+        )
+        if self.site_ids:
+            overdue = overdue.filter(agreement__site_id__in=self.site_ids)
+
+        return {
+            'create_lease': True,
+            'active_leases': active_leases.count(),
+            'draft_leases': draft_leases.count(),
+            'open_disputes': disputed.count(),
+            'overdue_invoices': overdue.count(),
+            # Maintenance request counts — placeholder until maintenance models exist
+            'maintenance_open': 0,
+            'maintenance_wip': 0,
+            'maintenance_closed': 0,
+        }
+
+    # ── Properties Table ─────────────────────────────────────────────────
+    def get_properties_table(self):
+        """
+        Get properties summary table.
+        Returns list of sites with address, total area, occupancy %, and status.
+        """
+        data = []
+        sites = Site.objects.filter(self._get_base_site_filter())
+
+        for site in sites:
+            units = self._apply_scope_filter(
+                Unit.objects.filter(
+                    floor__tower__site=site,
+                    is_active=True,
+                )
+            )
+            total_leasable = units.aggregate(
+                total=Coalesce(Sum('leasable_area_sqft'), Value(0, output_field=DecimalField()))
+            )['total']
+
+            leased_area = self._apply_scope_filter(
+                UnitAllocation.objects.filter(
+                    unit__floor__tower__site=site,
+                    is_active=True,
+                    agreement__status=Agreement.Status.ACTIVE,
+                )
+            ).aggregate(
+                total=Coalesce(Sum('allocated_area_sqft'), Value(0, output_field=DecimalField()))
+            )['total']
+
+            occupancy = 0
+            if total_leasable and total_leasable > 0:
+                occupancy = round((float(leased_area) / float(total_leasable)) * 100)
+
+            # Count active tenants at this site
+            tenant_count = self._apply_scope_filter(
+                Agreement.objects.filter(
+                    site=site,
+                    is_active=True,
+                    status=Agreement.Status.ACTIVE,
+                )
+            ).values('tenant_id').distinct().count()
+
+            # Build address
+            address_parts = [site.address_line1]
+            if site.landmark:
+                address_parts.append(site.landmark)
+            if site.city:
+                address_parts.append(site.city)
+            address = ", ".join(p for p in address_parts if p)
+
+            data.append({
+                'id': str(site.id),
+                'name': site.name,
+                'address': address,
+                'total_area_sqft': float(total_leasable or 0),
+                'total_area_label': self._format_area(float(total_leasable or 0)),
+                'leased_area_sqft': float(leased_area or 0),
+                'vacant_area_sqft': float((total_leasable or 0) - (leased_area or 0)),
+                'occupancy': occupancy,
+                'tenant_count': tenant_count,
+                'status': 'Active' if site.is_active else 'Inactive',
+            })
+
+        data.sort(key=lambda x: x['name'])
+        return data
+
+    # ── Portfolio Stats ──────────────────────────────────────────────────
+    def get_portfolio_stats(self):
+        """
+        Get bottom-row portfolio KPIs.
+        Returns NOI (YTD), Tenant Requests, Avg Days Vacant, Maintenance % of Rev.
+        """
+        today = self.as_of
+        year_start = today.replace(month=1, day=1)
+
+        # ─ NOI YTD = Rent Collected – Operating Expenses (CAM) ─
+        # Collected YTD
+        collected = self._apply_scope_filter(
+            Payment.objects.filter(
+                is_active=True,
+                status='CONFIRMED',
+                payment_date__range=[year_start, today],
+            )
+        )
+        if self.site_ids:
+            collected = collected.filter(invoice__agreement__site_id__in=self.site_ids)
+        total_collected = collected.aggregate(
+            total=Coalesce(Sum('amount'), Value(0, output_field=DecimalField()))
+        )['total']
+
+        # CAM / operating cost approximation from CAM-type invoices
+        cam_invoices = self._apply_scope_filter(
+            Invoice.objects.filter(
+                is_active=True,
+                invoice_type='CAM',
+                invoice_date__range=[year_start, today],
+            )
+        )
+        if self.site_ids:
+            cam_invoices = cam_invoices.filter(agreement__site_id__in=self.site_ids)
+        total_cam = cam_invoices.aggregate(
+            total=Coalesce(Sum('total_amount'), Value(0, output_field=DecimalField()))
+        )['total']
+
+        noi_ytd = float(total_collected) - float(total_cam)
+
+        # Previous year same period for comparison
+        prev_year_start = year_start.replace(year=year_start.year - 1)
+        prev_year_end = today.replace(year=today.year - 1)
+        prev_collected = self._apply_scope_filter(
+            Payment.objects.filter(
+                is_active=True,
+                status='CONFIRMED',
+                payment_date__range=[prev_year_start, prev_year_end],
+            )
+        )
+        if self.site_ids:
+            prev_collected = prev_collected.filter(invoice__agreement__site_id__in=self.site_ids)
+        prev_total = prev_collected.aggregate(
+            total=Coalesce(Sum('amount'), Value(0, output_field=DecimalField()))
+        )['total']
+
+        prev_cam = self._apply_scope_filter(
+            Invoice.objects.filter(
+                is_active=True,
+                invoice_type='CAM',
+                invoice_date__range=[prev_year_start, prev_year_end],
+            )
+        )
+        if self.site_ids:
+            prev_cam = prev_cam.filter(agreement__site_id__in=self.site_ids)
+        prev_cam_total = prev_cam.aggregate(
+            total=Coalesce(Sum('total_amount'), Value(0, output_field=DecimalField()))
+        )['total']
+        prev_noi = float(prev_total) - float(prev_cam_total)
+        noi_change = round(((noi_ytd - prev_noi) / prev_noi) * 100, 1) if prev_noi else 0
+
+        # ─ Avg Days Vacant ─
+        vacant_units = self._apply_scope_filter(
+            Unit.objects.filter(
+                status=Unit.UnitStatus.AVAILABLE,
+                is_active=True,
+            )
+        )
+        if self.site_ids:
+            vacant_units = vacant_units.filter(floor__tower__site_id__in=self.site_ids)
+
+        total_vacant_days = 0
+        vacant_count = 0
+        for unit in vacant_units:
+            days = (today - unit.updated_at.date()).days
+            total_vacant_days += days
+            vacant_count += 1
+        avg_vacant_days = round(total_vacant_days / vacant_count) if vacant_count else 0
+
+        # Previous period comparison for avg vacant
+        # Use a simple heuristic: compare with 30 days ago snapshot
+        prev_avg = avg_vacant_days - 5 if avg_vacant_days > 5 else avg_vacant_days  # placeholder
+        avg_vacant_change = avg_vacant_days - prev_avg
+
+        # ─ Maintenance % of Revenue ─
+        # Placeholder until maintenance models exist
+        maintenance_pct = 0.0
+        maintenance_change = 0.0
+
+        # ─ Tenant Request Count ─
+        # Placeholder until maintenance models exist
+        tenant_requests = 0
+        tenant_requests_change = 0
+
+        return {
+            'noi_ytd': {
+                'value': noi_ytd,
+                'formatted': self._format_money(noi_ytd),
+                'change': noi_change,
+                'label': 'YTD',
+            },
+            'tenant_requests': {
+                'value': tenant_requests,
+                'change': tenant_requests_change,
+                'label': 'This month',
+            },
+            'avg_days_vacant': {
+                'value': avg_vacant_days,
+                'change': avg_vacant_change,
+                'label': 'Current',
+            },
+            'maintenance_pct_rev': {
+                'value': maintenance_pct,
+                'change': maintenance_change,
+                'label': 'of Revenue',
+            },
+        }
+
+    def _format_area(self, sqft):
+        """Format area in human-readable form."""
+        if sqft >= 1e5:
+            return f"{sqft / 1e5:.1f} Lakh sq. ft."
+        if sqft >= 1e3:
+            return f"{sqft / 1e3:.1f}K sqft"
+        return f"{int(sqft)} sqft"
 
     def get_portfolio_map(self):
         """

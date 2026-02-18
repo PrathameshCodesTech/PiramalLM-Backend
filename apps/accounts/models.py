@@ -9,6 +9,13 @@ from apps.core.models import AuditModel
 class Org(AuditModel):
     name = models.CharField(max_length=200)
     code = models.SlugField(max_length=80, unique=True)
+    legal_name = models.CharField(max_length=300, blank=True, default="")
+    registration_number = models.CharField(max_length=100, blank=True, default="")
+    tax_id = models.CharField(max_length=100, blank=True, default="")
+    address = models.TextField(blank=True, default="")
+    city = models.CharField(max_length=100, blank=True, default="")
+    state = models.CharField(max_length=100, blank=True, default="")
+    country = models.CharField(max_length=100, blank=True, default="")
 
     def __str__(self):
         return self.name
@@ -246,6 +253,12 @@ class UserProfile(AuditModel):
         TENANT = "TENANT", "Tenant"
         VIEWER = "VIEWER", "Viewer"
 
+    class UserStatus(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        INACTIVE = "INACTIVE", "Inactive"
+        PENDING = "PENDING", "Pending"
+        SUSPENDED = "SUSPENDED", "Suspended"
+
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile")
     role = models.CharField(
         max_length=20,
@@ -253,6 +266,13 @@ class UserProfile(AuditModel):
         default=UserRole.VIEWER,
         help_text="User's primary role in the system"
     )
+    status = models.CharField(
+        max_length=20,
+        choices=UserStatus.choices,
+        default=UserStatus.ACTIVE,
+        db_index=True,
+    )
+    department = models.CharField(max_length=100, blank=True, default="")
     profile_json = models.JSONField(
         default=dict,
         blank=True,
@@ -260,9 +280,37 @@ class UserProfile(AuditModel):
     )
     phone = models.CharField(max_length=20, blank=True)
     avatar = models.ImageField(upload_to="avatars/", null=True, blank=True)
+    invite_token = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    invite_accepted = models.BooleanField(default=False)
 
     def __str__(self):
         return f"Profile {self.user_id}"
+
+
+class UserChangeLog(models.Model):
+    """Audit trail for user profile / role / status changes."""
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="change_logs",
+    )
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="user_changes_made",
+    )
+    field_changed = models.CharField(max_length=100)
+    old_value = models.CharField(max_length=500, blank=True, default="")
+    new_value = models.CharField(max_length=500, blank=True, default="")
+    changed_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-changed_at"]
+
+    def __str__(self):
+        return f"{self.user_id}.{self.field_changed} @ {self.changed_at}"
 
 
 class Permission(AuditModel):
@@ -275,10 +323,62 @@ class Permission(AuditModel):
 
 
 class Role(AuditModel):
+    class RoleType(models.TextChoices):
+        ADMIN = "ADMIN", "Admin"
+        BUSINESS = "BUSINESS", "Business (Internal)"
+        TENANT = "TENANT", "Tenant"
+        READONLY = "READONLY", "Read-only"
+
+    class RoleStatus(models.TextChoices):
+        DRAFT = "DRAFT", "Draft"
+        PUBLISHED = "PUBLISHED", "Published"
+
+    class DataScopeType(models.TextChoices):
+        ALL = "ALL", "All Properties"
+        SELECTED = "SELECTED", "Specific Properties"
+
     scope = models.ForeignKey(TenantScope, on_delete=models.CASCADE, related_name="roles")
     name = models.CharField(max_length=200)
     code = models.SlugField(max_length=80)
+    description = models.TextField(blank=True, default="")
+    role_type = models.CharField(
+        max_length=20,
+        choices=RoleType.choices,
+        default=RoleType.BUSINESS,
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=RoleStatus.choices,
+        default=RoleStatus.DRAFT,
+        db_index=True,
+    )
     is_system = models.BooleanField(default=False)
+    base_on = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="derived_roles",
+    )
+    # Approval capabilities
+    approval_cap_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True,
+        help_text="Max lease value this role can approve (INR)",
+    )
+    can_approve_amendments = models.BooleanField(default=False)
+    can_approve_waivers = models.BooleanField(default=False)
+    can_modify_matrices = models.BooleanField(default=False)
+    # Data scope
+    data_scope_type = models.CharField(
+        max_length=20,
+        choices=DataScopeType.choices,
+        default=DataScopeType.ALL,
+    )
+    data_scope_property_ids = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="List of site IDs if data_scope_type=SELECTED",
+    )
     permissions = models.ManyToManyField(Permission, through="RolePermission", related_name="roles")
 
     class Meta:
@@ -289,6 +389,10 @@ class Role(AuditModel):
     def __str__(self):
         return f"{self.scope_id}:{self.code}"
 
+    def publish(self):
+        self.status = self.RoleStatus.PUBLISHED
+        self.save(update_fields=["status", "updated_at"])
+
 
 class RolePermission(AuditModel):
     role = models.ForeignKey(Role, on_delete=models.CASCADE, related_name="role_permissions")
@@ -298,5 +402,37 @@ class RolePermission(AuditModel):
         constraints = [
             models.UniqueConstraint(fields=["role", "permission"], name="uq_role_permission"),
         ]
+
+
+class ModulePermission(AuditModel):
+    """Per-module CRUD+Approve access flags for a Role."""
+
+    class Module(models.TextChoices):
+        PROPERTY = "PROPERTY", "Property & Unit Master"
+        TENANT = "TENANT", "Tenant & Contact CRM"
+        LEASE = "LEASE", "Lease & Amendments"
+        REVENUE = "REVENUE", "Rent Schedule & Revenue"
+        AR = "AR", "Invoices & Receipts (AR)"
+        COLLECTIONS = "COLLECTIONS", "Collections & Disputes"
+        DASHBOARD = "DASHBOARD", "Dashboards & Analytics"
+        APPROVALS = "APPROVALS", "Approval Workflows & Matrices"
+        DOCUMENTS = "DOCUMENTS", "Documents & Compliance / Audit Trail"
+
+    role = models.ForeignKey(Role, on_delete=models.CASCADE, related_name="module_permissions")
+    module = models.CharField(max_length=30, choices=Module.choices)
+    can_view = models.BooleanField(default=False)
+    can_create = models.BooleanField(default=False)
+    can_edit = models.BooleanField(default=False)
+    can_delete = models.BooleanField(default=False)
+    can_approve = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["role", "module"], name="uq_module_permission_role_module"),
+        ]
+        ordering = ["module"]
+
+    def __str__(self):
+        return f"Role({self.role_id}).{self.module}"
 
 

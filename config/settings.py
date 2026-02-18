@@ -60,6 +60,7 @@ INSTALLED_APPS = [
     'apps.maintenance',
     'apps.communications',
     'apps.reports',
+    'apps.approvals',
 ]
 
 MIDDLEWARE = [

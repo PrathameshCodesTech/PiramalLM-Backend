@@ -62,7 +62,8 @@ class InvoiceLineItemCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.InvoiceLineItem
         fields = (
-            "item_type", "description", "quantity", "unit_price", "tax_rate", "unit"
+            "item_type", "description", "quantity", "unit_price", "tax_rate",
+            "period_start", "period_end", "unit"
         )
 
 
@@ -71,18 +72,33 @@ class InvoiceLineItemCreateSerializer(serializers.ModelSerializer):
 class InvoiceListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for list views."""
     tenant_name = serializers.SerializerMethodField()
+    lease_id = serializers.SerializerMethodField()
+    period = serializers.SerializerMethodField()
     days_overdue = serializers.SerializerMethodField()
+    applied_credits = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Invoice
         fields = (
             "id", "invoice_number", "invoice_type", "status",
-            "invoice_date", "due_date", "total_amount", "balance_due",
-            "tenant_name", "days_overdue", "is_disputed"
+            "invoice_date", "due_date", "period_start", "period_end",
+            "subtotal", "tax_amount", "total_amount", "balance_due",
+            "tenant_name", "lease_id", "period", "days_overdue",
+            "applied_credits", "is_disputed", "agreement"
         )
 
     def get_tenant_name(self, obj):
         return obj.agreement.tenant.legal_name if obj.agreement and obj.agreement.tenant else None
+
+    def get_lease_id(self, obj):
+        return obj.agreement.lease_id if obj.agreement else None
+
+    def get_period(self, obj):
+        if obj.period_start and obj.period_end:
+            return f"{obj.period_start} to {obj.period_end}"
+        if obj.period_start:
+            return str(obj.period_start)
+        return None
 
     def get_days_overdue(self, obj):
         from django.utils import timezone
@@ -91,6 +107,11 @@ class InvoiceListSerializer(serializers.ModelSerializer):
             if today > obj.due_date:
                 return (today - obj.due_date).days
         return 0
+
+    def get_applied_credits(self, obj):
+        from django.db.models import Sum
+        applied = obj.credit_notes.filter(status="APPLIED").aggregate(s=Sum("amount"))["s"]
+        return float(applied or 0)
 
 
 class InvoiceSerializer(serializers.ModelSerializer):
@@ -105,12 +126,14 @@ class InvoiceSerializer(serializers.ModelSerializer):
 
 
 class InvoiceDetailSerializer(serializers.ModelSerializer):
-    """Full detail serializer with line items and payments."""
+    """Full detail serializer with line items, payments, credit notes, attachments."""
     line_items = InvoiceLineItemSerializer(many=True, read_only=True)
     payments = serializers.SerializerMethodField()
     credit_notes = serializers.SerializerMethodField()
+    attachments = serializers.SerializerMethodField()
     tenant_details = serializers.SerializerMethodField()
     agreement_details = serializers.SerializerMethodField()
+    bill_to = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Invoice
@@ -125,6 +148,18 @@ class InvoiceDetailSerializer(serializers.ModelSerializer):
 
     def get_credit_notes(self, obj):
         return CreditNoteListSerializer(obj.credit_notes.all(), many=True).data
+
+    def get_attachments(self, obj):
+        return InvoiceAttachmentListSerializer(obj.attachments.all(), many=True).data
+
+    def get_bill_to(self, obj):
+        if obj.agreement and obj.agreement.tenant:
+            t = obj.agreement.tenant
+            parts = [t.legal_name]
+            if getattr(t, "address", None):
+                parts.append(t.address)
+            return ", ".join(filter(None, parts))
+        return None
 
     def get_tenant_details(self, obj):
         if obj.agreement and obj.agreement.tenant:
@@ -193,16 +228,56 @@ class InvoiceCreateSerializer(serializers.ModelSerializer):
         return invoice
 
 
+class InvoiceUpdateSerializer(serializers.ModelSerializer):
+    """For updating invoices with line items (draft only)."""
+    line_items = InvoiceLineItemCreateSerializer(many=True, required=False)
+
+    class Meta:
+        model = models.Invoice
+        fields = (
+            "agreement", "invoice_type", "invoice_date", "due_date",
+            "period_start", "period_end", "subtotal", "tax_amount", "total_amount",
+            "currency", "notes", "line_items"
+        )
+
+    def update(self, instance, validated_data):
+        if instance.status != models.Invoice.InvoiceStatus.DRAFT:
+            raise serializers.ValidationError("Only draft invoices can be edited.")
+
+        line_items_data = validated_data.pop("line_items", None)
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        if line_items_data is not None:
+            instance.line_items.all().delete()
+            for item_data in line_items_data:
+                models.InvoiceLineItem.objects.create(
+                    invoice=instance,
+                    scope=instance.scope,
+                    created_by=self.context["request"].user,
+                    **item_data
+                )
+
+        return instance
+
+
 # ===================== Payment Serializers =====================
 
 class PaymentListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for list views."""
+    reference = serializers.SerializerMethodField()
+
     class Meta:
         model = models.Payment
         fields = (
             "id", "payment_number", "payment_date", "amount",
-            "payment_method", "status", "reference_number"
+            "payment_method", "status", "reference_number", "reference"
         )
+
+    def get_reference(self, obj):
+        return obj.transaction_id or obj.reference_number or ""
 
 
 class PaymentSerializer(serializers.ModelSerializer):
@@ -267,12 +342,17 @@ class PaymentDetailSerializer(serializers.ModelSerializer):
 
 class CreditNoteListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for list views."""
+    applied_amount = serializers.SerializerMethodField()
+
     class Meta:
         model = models.CreditNote
         fields = (
             "id", "credit_note_number", "credit_note_date", "amount",
-            "reason", "status"
+            "reason", "status", "applied_amount"
         )
+
+    def get_applied_amount(self, obj):
+        return float(obj.amount) if obj.status == "APPLIED" else 0
 
 
 class CreditNoteSerializer(serializers.ModelSerializer):
@@ -336,6 +416,24 @@ class CreditNoteDetailSerializer(serializers.ModelSerializer):
         if obj.approved_by:
             return obj.approved_by.get_full_name() or obj.approved_by.email
         return None
+
+
+# ===================== Invoice Attachment Serializers =====================
+
+class InvoiceAttachmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.InvoiceAttachment
+        fields = ("id", "invoice", "filename", "file_size", "created_at", "file")
+        read_only_fields = ("id", "scope", "created_at", "created_by", "file_size")
+
+
+class InvoiceAttachmentListSerializer(serializers.ModelSerializer):
+    """Lightweight for list (no file URL)."""
+    upload_date = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = models.InvoiceAttachment
+        fields = ("id", "filename", "file_size", "upload_date")
 
 
 # ===================== Invoice Schedule Serializers =====================
@@ -750,6 +848,84 @@ class ARGlobalSettingsUpdateSerializer(serializers.ModelSerializer):
             "id", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+
+
+# =============================================================================
+# RENT SCHEDULE LINE SERIALIZERS (Tab 1 - Rent Schedule & Revenue Recognition)
+# =============================================================================
+
+class RentScheduleLineListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for list views."""
+    tenant_name = serializers.SerializerMethodField()
+    lease_id = serializers.SerializerMethodField()
+    site_name = serializers.SerializerMethodField()
+    unit_label = serializers.SerializerMethodField()
+    period = serializers.SerializerMethodField()
+    effective_amount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.RentScheduleLine
+        fields = (
+            "id", "agreement", "unit", "period_start", "period_end", "period",
+            "charge_type", "amount_before_tax", "gst", "amount_after_tax",
+            "effective_amount", "due_date", "status", "escalation_applied",
+            "notes", "tenant_name", "lease_id", "site_name", "unit_label",
+            "override_amount", "adjustment_reason", "invoice"
+        )
+
+    def get_tenant_name(self, obj):
+        return obj.agreement.tenant.legal_name if obj.agreement and obj.agreement.tenant else None
+
+    def get_lease_id(self, obj):
+        return obj.agreement.lease_id if obj.agreement else None
+
+    def get_site_name(self, obj):
+        return obj.agreement.site.name if obj.agreement and getattr(obj.agreement, "site", None) else None
+
+    def get_unit_label(self, obj):
+        return obj.unit.unit_no if obj.unit else None
+
+    def get_period(self, obj):
+        return f"{obj.period_start} to {obj.period_end}" if obj.period_start and obj.period_end else None
+
+    def get_effective_amount(self, obj):
+        return obj.override_amount if obj.override_amount is not None else obj.amount_after_tax
+
+
+class RentScheduleLineDetailSerializer(serializers.ModelSerializer):
+    """Full detail with linked invoice info."""
+    tenant_name = serializers.SerializerMethodField()
+    lease_id = serializers.SerializerMethodField()
+    site_name = serializers.SerializerMethodField()
+    unit_label = serializers.SerializerMethodField()
+    period = serializers.SerializerMethodField()
+    invoice_number = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.RentScheduleLine
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+    def get_tenant_name(self, obj):
+        return obj.agreement.tenant.legal_name if obj.agreement and obj.agreement.tenant else None
+
+    def get_lease_id(self, obj):
+        return obj.agreement.lease_id if obj.agreement else None
+
+    def get_site_name(self, obj):
+        return obj.agreement.site.name if obj.agreement and getattr(obj.agreement, "site", None) else None
+
+    def get_unit_label(self, obj):
+        return obj.unit.unit_no if obj.unit else None
+
+    def get_period(self, obj):
+        return f"{obj.period_start} to {obj.period_end}" if obj.period_start and obj.period_end else None
+
+    def get_invoice_number(self, obj):
+        return obj.invoice.invoice_number if obj.invoice else None
 
 
 # =============================================================================

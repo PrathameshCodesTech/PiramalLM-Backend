@@ -33,4 +33,5 @@ urlpatterns = [
     path('api/v1/maintenance/', include('apps.maintenance.urls')),
     path('api/v1/communications/', include('apps.communications.urls')),
     path('api/v1/reports/', include('apps.reports.urls')),
+    path('api/v1/approvals/', include('apps.approvals.urls')),
 ]

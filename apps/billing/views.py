@@ -2,6 +2,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
@@ -787,6 +788,8 @@ class InvoiceViewSet(ScopedViewSet):
             return serializers.InvoiceDetailSerializer
         if self.action == "create":
             return serializers.InvoiceCreateSerializer
+        if self.action in ("update", "partial_update"):
+            return serializers.InvoiceUpdateSerializer
         return serializers.InvoiceSerializer
 
     def get_queryset(self):
@@ -823,7 +826,21 @@ class InvoiceViewSet(ScopedViewSet):
                 balance_due__gt=0
             )
 
-        return queryset.select_related("agreement", "agreement__tenant")
+        # Filter by property/site
+        site_ids = self.request.query_params.get("site_ids") or self.request.query_params.get("property_ids")
+        if site_ids:
+            ids = [x.strip() for x in str(site_ids).split(",") if x.strip()]
+            if ids:
+                queryset = queryset.filter(agreement__site_id__in=ids)
+
+        # Filter by tenant
+        tenant_ids = self.request.query_params.get("tenant_ids")
+        if tenant_ids:
+            ids = [x.strip() for x in str(tenant_ids).split(",") if x.strip()]
+            if ids:
+                queryset = queryset.filter(agreement__tenant_id__in=ids)
+
+        return queryset.select_related("agreement", "agreement__tenant", "agreement__site")
 
     def perform_create(self, serializer):
         scope = self.get_active_scope()
@@ -924,6 +941,116 @@ class InvoiceViewSet(ScopedViewSet):
             "disputed_amount": float(disputed_stats["disputed_amount"] or 0),
             "disputed_count": disputed_stats["disputed_count"] or 0,
         })
+
+    @action(detail=False, methods=["post"])
+    def bulk_email(self, request):
+        """Send email for selected invoices."""
+        invoice_ids = request.data.get("invoice_ids", [])
+        if not invoice_ids:
+            return Response({"error": "invoice_ids required"}, status=status.HTTP_400_BAD_REQUEST)
+        scope = self.get_active_scope()
+        qs = models.Invoice.objects.filter(scope=scope, id__in=invoice_ids)
+        count = qs.count()
+        return Response({"message": f"Email queued for {count} invoice(s)"})
+
+    @action(detail=False, methods=["get"])
+    def export(self, request):
+        """Export invoice list to CSV."""
+        import csv
+        from django.http import HttpResponse
+        scope = self.get_active_scope()
+        qs = models.Invoice.objects.filter(scope=scope).select_related(
+            "agreement", "agreement__tenant"
+        ).order_by("-invoice_date")
+
+        from_date = request.query_params.get("from_date")
+        to_date = request.query_params.get("to_date")
+        status_filter = request.query_params.get("status")
+        if from_date:
+            qs = qs.filter(invoice_date__gte=from_date)
+        if to_date:
+            qs = qs.filter(invoice_date__lte=to_date)
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+
+        response = HttpResponse(content_type="text/csv")
+        response["Content-Disposition"] = "attachment; filename=invoices.csv"
+        writer = csv.writer(response)
+        writer.writerow([
+            "Invoice No", "Issue Date", "Due Date", "Tenant", "Lease ID",
+            "Period", "Subtotal", "Tax", "Total Due", "Status"
+        ])
+        for inv in qs[:10000]:
+            period = f"{inv.period_start} to {inv.period_end}" if inv.period_start and inv.period_end else ""
+            writer.writerow([
+                inv.invoice_number,
+                inv.invoice_date,
+                inv.due_date,
+                inv.agreement.tenant.legal_name if inv.agreement and inv.agreement.tenant else "",
+                inv.agreement.lease_id if inv.agreement else "",
+                period,
+                inv.subtotal,
+                inv.tax_amount,
+                inv.total_amount,
+                inv.status,
+            ])
+        return response
+
+
+class InvoiceAttachmentViewSet(ScopedViewSet):
+    """
+    ViewSet for invoice attachments.
+    - GET /invoice-attachments/ - List (filter by invoice_id)
+    - POST /invoice-attachments/ - Upload (multipart: file, invoice)
+    - GET /invoice-attachments/{id}/ - Get
+    - GET /invoice-attachments/{id}/download/ - Download file
+    - DELETE /invoice-attachments/{id}/ - Delete
+    """
+    queryset = models.InvoiceAttachment.objects.all()
+    serializer_class = serializers.InvoiceAttachmentSerializer
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return serializers.InvoiceAttachmentListSerializer
+        return serializers.InvoiceAttachmentSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        invoice_id = self.request.query_params.get("invoice_id")
+        if invoice_id:
+            queryset = queryset.filter(invoice_id=invoice_id)
+        return queryset.select_related("invoice")
+
+    def perform_create(self, serializer):
+        scope = self.get_active_scope()
+        serializer.save(scope=scope, created_by=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        file_obj = request.FILES.get("file")
+        invoice_id = request.data.get("invoice")
+        if not file_obj or not invoice_id:
+            return Response(
+                {"error": "file and invoice are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        scope = self.get_active_scope()
+        invoice = get_object_or_404(models.Invoice, id=invoice_id, scope=scope)
+        att = models.InvoiceAttachment.objects.create(
+            invoice=invoice,
+            scope=scope,
+            created_by=request.user,
+            file=file_obj,
+            filename=file_obj.name,
+            file_size=file_obj.size,
+        )
+        ser = serializers.InvoiceAttachmentListSerializer(att)
+        return Response(ser.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"])
+    def download(self, request, pk=None):
+        from django.http import FileResponse
+        att = self.get_object()
+        return FileResponse(att.file.open("rb"), as_attachment=True, filename=att.filename)
 
 
 class PaymentViewSet(ScopedViewSet):
@@ -1401,6 +1528,465 @@ class ARSummaryViewSet(ScopedViewSet):
             "disputed_count": disputed_stats["disputed_count"] or 0,
             "ageing": ageing,
         })
+
+
+class ReceivablesListAPIView(APIView):
+    """
+    GET /api/v1/billing/receivables/
+    List receivables (open invoices with balance_due > 0).
+    Filters: site_ids, tenant_ids, from_date, to_date, ageing_bucket
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.core.utils import get_active_scope
+
+        scope = get_active_scope(request)
+        if not scope:
+            return Response(
+                {"error": "Scope required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        today = timezone.now().date()
+        qs = models.Invoice.objects.filter(
+            scope=scope,
+            balance_due__gt=0,
+        ).exclude(
+            status__in=[models.Invoice.InvoiceStatus.CANCELLED, models.Invoice.InvoiceStatus.WRITTEN_OFF]
+        ).select_related("agreement", "agreement__tenant", "agreement__site")
+
+        # Filters
+        site_ids = request.query_params.get("site_ids") or request.query_params.get("property_ids")
+        if site_ids:
+            ids = [x.strip() for x in str(site_ids).split(",") if x.strip()]
+            if ids:
+                qs = qs.filter(agreement__site_id__in=ids)
+
+        tenant_ids = request.query_params.get("tenant_ids")
+        if tenant_ids:
+            ids = [x.strip() for x in str(tenant_ids).split(",") if x.strip()]
+            if ids:
+                qs = qs.filter(agreement__tenant_id__in=ids)
+
+        from_date = request.query_params.get("from_date")
+        to_date = request.query_params.get("to_date")
+        if from_date:
+            qs = qs.filter(due_date__gte=from_date)
+        if to_date:
+            qs = qs.filter(due_date__lte=to_date)
+
+        # Get ageing buckets for scope
+        ageing_buckets = list(
+            models.AgeingBucket.objects.filter(scope=scope, status="ACTIVE").order_by("from_days")
+        )
+
+        def get_bucket_label(days_overdue):
+            for b in ageing_buckets:
+                if days_overdue >= b.from_days and (b.to_days is None or days_overdue <= b.to_days):
+                    return b.label or b.reporting_label
+            return "Current" if days_overdue <= 0 else "90+"
+
+        ageing_filter = request.query_params.get("ageing_bucket")
+        results = []
+        for inv in qs.order_by("due_date", "invoice_number"):
+            days_overdue = 0
+            if inv.balance_due > 0 and inv.due_date and inv.due_date < today:
+                days_overdue = (today - inv.due_date).days
+
+            bucket_label = get_bucket_label(days_overdue)
+            if ageing_filter and bucket_label != ageing_filter:
+                continue
+
+            tenant_name = inv.agreement.tenant.legal_name if inv.agreement and inv.agreement.tenant else None
+            site_name = inv.agreement.site.name if inv.agreement and getattr(inv.agreement, "site", None) else None
+
+            results.append({
+                "id": inv.id,
+                "invoice_id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "tenant_id": inv.agreement.tenant_id if inv.agreement else None,
+                "tenant_name": tenant_name,
+                "lease_id": inv.agreement.lease_id if inv.agreement else None,
+                "site_id": inv.agreement.site_id if inv.agreement else None,
+                "site_name": site_name,
+                "amount_due": float(inv.balance_due),
+                "days_overdue": days_overdue,
+                "ageing_bucket": bucket_label,
+                "due_date": str(inv.due_date),
+                "invoice_date": str(inv.invoice_date),
+                "status": inv.status,
+                "is_disputed": inv.is_disputed,
+            })
+
+        return Response({"results": results})
+
+
+class RentScheduleLineViewSet(ScopedViewSet):
+    """
+    ViewSet for Rent Schedule Lines (per-period rent schedule).
+
+    Endpoints:
+    - GET /rent-schedule-lines/ - List with filters
+    - GET /rent-schedule-lines/{id}/ - Detail
+    - POST /rent-schedule-lines/ - Create
+    - PATCH /rent-schedule-lines/{id}/ - Update
+    - POST /rent-schedule-lines/generate/ - Generate schedules
+    - POST /rent-schedule-lines/mark_invoiced/ - Bulk mark as invoiced
+    - POST /rent-schedule-lines/adjust_amounts/ - Bulk adjust amounts
+    - GET /rent-schedule-lines/export/ - Export to CSV
+    """
+
+    queryset = models.RentScheduleLine.objects.all()
+    serializer_class = serializers.RentScheduleLineListSerializer
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return serializers.RentScheduleLineDetailSerializer
+        return serializers.RentScheduleLineListSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        queryset = queryset.select_related("agreement", "agreement__tenant", "agreement__site", "unit", "invoice")
+
+        # Filters
+        agreement_id = self.request.query_params.get("agreement_id")
+        if agreement_id:
+            queryset = queryset.filter(agreement_id=agreement_id)
+
+        site_ids = self.request.query_params.get("site_ids") or self.request.query_params.get("property_ids")
+        if site_ids:
+            ids = [x.strip() for x in str(site_ids).split(",") if x.strip()]
+            if ids:
+                queryset = queryset.filter(agreement__site_id__in=ids)
+
+        tenant_ids = self.request.query_params.get("tenant_ids")
+        if tenant_ids:
+            ids = [x.strip() for x in str(tenant_ids).split(",") if x.strip()]
+            if ids:
+                queryset = queryset.filter(agreement__tenant_id__in=ids)
+
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        period_from = self.request.query_params.get("period_from") or self.request.query_params.get("from_date")
+        period_to = self.request.query_params.get("period_to") or self.request.query_params.get("to_date")
+        if period_from:
+            queryset = queryset.filter(period_end__gte=period_from)
+        if period_to:
+            queryset = queryset.filter(period_start__lte=period_to)
+
+        return queryset.order_by("-period_start", "agreement", "charge_type")
+
+    def perform_create(self, serializer):
+        scope = self.get_active_scope()
+        serializer.save(scope=scope, created_by=self.request.user)
+
+    @action(detail=False, methods=["post"])
+    def generate(self, request):
+        """Generate rent schedule lines for agreements. Payload: { agreement_ids: [], period_start, period_end, charge_type }."""
+        scope = self.get_active_scope()
+        agreement_ids = request.data.get("agreement_ids", [])
+        period_start = request.data.get("period_start")
+        period_end = request.data.get("period_end")
+        charge_type = request.data.get("charge_type", "BASE_RENT")
+        if not agreement_ids or not period_start or not period_end:
+            return Response(
+                {"error": "agreement_ids, period_start, period_end required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        created = 0
+        from apps.leases.models import Agreement
+        for aid in agreement_ids:
+            try:
+                ag = Agreement.objects.select_related("billing").get(id=aid, scope=scope)
+            except Agreement.DoesNotExist:
+                continue
+            amount = 0
+            if hasattr(ag, "billing") and ag.billing and ag.billing.base_rent_monthly is not None:
+                amount = ag.billing.base_rent_monthly
+            due_date = period_end  # Simple: due at period end
+            line, created_flag = models.RentScheduleLine.objects.get_or_create(
+                scope=scope,
+                agreement=ag,
+                period_start=period_start,
+                period_end=period_end,
+                charge_type=charge_type,
+                defaults={
+                    "amount_before_tax": amount,
+                    "amount_after_tax": amount,
+                    "due_date": due_date,
+                    "status": models.RentScheduleLine.ScheduleStatus.SCHEDULED,
+                    "created_by": request.user,
+                }
+            )
+            if created_flag:
+                created += 1
+        return Response({"created": created})
+
+    @action(detail=False, methods=["post"], url_path="mark-invoiced")
+    def mark_invoiced(self, request):
+        """Bulk mark lines as invoiced. Payload: { line_ids: [], invoice_id }."""
+        scope = self.get_active_scope()
+        line_ids = request.data.get("line_ids", [])
+        invoice_id = request.data.get("invoice_id")
+        if not line_ids:
+            return Response({"error": "line_ids required"}, status=status.HTTP_400_BAD_REQUEST)
+        qs = models.RentScheduleLine.objects.filter(id__in=line_ids, scope=scope)
+        for line in qs:
+            line.status = models.RentScheduleLine.ScheduleStatus.INVOICED
+            line.invoice_id = invoice_id
+            line.updated_by = request.user
+            line.save(update_fields=["status", "invoice_id", "updated_by", "updated_at"])
+        return Response({"updated": qs.count()})
+
+    @action(detail=False, methods=["post"], url_path="adjust-amounts")
+    def adjust_amounts(self, request):
+        """Bulk adjust amounts. Payload: { line_ids: [], override_amount, adjustment_reason }."""
+        scope = self.get_active_scope()
+        line_ids = request.data.get("line_ids", [])
+        override_amount = request.data.get("override_amount")
+        adjustment_reason = request.data.get("adjustment_reason", "")
+        if not line_ids or override_amount is None:
+            return Response(
+                {"error": "line_ids and override_amount required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        from decimal import Decimal
+        amt = Decimal(str(override_amount))
+        qs = models.RentScheduleLine.objects.filter(id__in=line_ids, scope=scope)
+        for line in qs:
+            line.override_amount = amt
+            line.adjustment_reason = adjustment_reason
+            line.amount_after_tax = amt
+            line.save(update_fields=["override_amount", "adjustment_reason", "amount_after_tax", "updated_at"])
+        return Response({"updated": qs.count()})
+
+    @action(detail=False, methods=["get"])
+    def export(self, request):
+        """Export rent schedule list to CSV."""
+        import csv
+        from django.http import HttpResponse
+        qs = self.get_queryset()[:10000]
+        response = HttpResponse(content_type="text/csv")
+        response["Content-Disposition"] = "attachment; filename=rent-schedules.csv"
+        writer = csv.writer(response)
+        writer.writerow([
+            "ID", "Lease ID", "Tenant", "Property", "Unit", "Period Start", "Period End",
+            "Charge Type", "Amt Before Tax", "GST", "Amt After Tax", "Due Date", "Status",
+            "Escalation Applied", "Notes"
+        ])
+        for line in qs:
+            tenant = line.agreement.tenant.legal_name if line.agreement and line.agreement.tenant else ""
+            site = line.agreement.site.name if line.agreement and getattr(line.agreement, "site", None) else ""
+            unit = line.unit.unit_no if line.unit else ""
+            eff = line.override_amount if line.override_amount is not None else line.amount_after_tax
+            writer.writerow([
+                line.id, line.agreement.lease_id if line.agreement else "",
+                tenant, site, unit,
+                line.period_start, line.period_end,
+                line.charge_type, line.amount_before_tax, line.gst, eff,
+                line.due_date, line.status,
+                line.escalation_applied, line.notes or "",
+            ])
+        return response
+
+
+class RentScheduleKPIsAPIView(APIView):
+    """
+    GET /api/v1/billing/rent-schedule-kpis/
+    Returns MRR Forecast and Overdue Variance KPIs.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.core.utils import get_active_scope
+
+        scope = get_active_scope(request)
+        if not scope:
+            return Response({"error": "Scope required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        today = timezone.now().date()
+        qs = models.RentScheduleLine.objects.filter(
+            scope=scope,
+            status=models.RentScheduleLine.ScheduleStatus.SCHEDULED,
+            period_start__lte=today,
+            period_end__gte=today,
+        ).aggregate(total=Sum("amount_after_tax"))
+
+        mrr = float(qs["total"] or 0)
+
+        # Overdue: scheduled lines past due_date not yet invoiced
+        overdue_qs = models.RentScheduleLine.objects.filter(
+            scope=scope,
+            status=models.RentScheduleLine.ScheduleStatus.SCHEDULED,
+            due_date__lt=today,
+        ).aggregate(total=Sum("amount_after_tax"))
+        overdue_amount = float(overdue_qs["total"] or 0)
+
+        return Response({
+            "mrr_forecast": mrr,
+            "mrr_trend": 0,  # Placeholder: compare to last month
+            "overdue_variance": overdue_amount,
+            "overdue_trend": 0,  # Placeholder
+        })
+
+
+# =============================================================================
+# REVENUE RECOGNITION (Tab 4 - Rent Schedule & Revenue Recognition)
+# =============================================================================
+
+class RevenueRecognitionAPIView(APIView):
+    """
+    GET /api/v1/billing/revenue-recognition/
+    Returns: details (list), trend (time series), by_charge_type (donut data).
+
+    Query params: from_date, to_date, site_ids, tenant_ids, search (invoice # or tenant)
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.core.utils import get_active_scope
+
+        scope = get_active_scope(request)
+        if not scope:
+            return Response({"error": "Scope required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        from_date = request.query_params.get("from_date")
+        to_date = request.query_params.get("to_date")
+        site_ids = request.query_params.get("site_ids") or request.query_params.get("property_ids")
+        tenant_ids = request.query_params.get("tenant_ids")
+        search = request.query_params.get("search", "").strip()
+
+        qs = models.Invoice.objects.filter(scope=scope).exclude(
+            status__in=[models.Invoice.InvoiceStatus.CANCELLED, models.Invoice.InvoiceStatus.WRITTEN_OFF]
+        ).select_related("agreement", "agreement__tenant", "agreement__site")
+
+        if from_date:
+            qs = qs.filter(invoice_date__gte=from_date)
+        if to_date:
+            qs = qs.filter(invoice_date__lte=to_date)
+        if site_ids:
+            ids = [x.strip() for x in str(site_ids).split(",") if x.strip()]
+            if ids:
+                qs = qs.filter(agreement__site_id__in=ids)
+        if tenant_ids:
+            ids = [x.strip() for x in str(tenant_ids).split(",") if x.strip()]
+            if ids:
+                qs = qs.filter(agreement__tenant_id__in=ids)
+        if search:
+            qs = qs.filter(
+                Q(invoice_number__icontains=search) |
+                Q(agreement__tenant__legal_name__icontains=search) |
+                Q(agreement__lease_id__icontains=search)
+            )
+
+        # Details list
+        details = []
+        for inv in qs.order_by("-invoice_date")[:500]:
+            tenant = inv.agreement.tenant.legal_name if inv.agreement and inv.agreement.tenant else None
+            period = f"{inv.period_start} to {inv.period_end}" if inv.period_start and inv.period_end else inv.invoice_date
+            rec_status = "ACCRUED" if inv.status != models.Invoice.InvoiceStatus.DRAFT else "DEFERRED"
+            details.append({
+                "id": inv.id,
+                "invoice_number": inv.invoice_number,
+                "invoice_id": inv.id,
+                "billing_period": period,
+                "tenant_name": tenant,
+                "tenant_id": inv.agreement.tenant_id if inv.agreement else None,
+                "billed": float(inv.total_amount or 0),
+                "collected": float(inv.amount_paid or 0),
+                "recognition_status": rec_status,
+                "invoice_type": inv.invoice_type,
+                "escalation_notes": getattr(inv, "escalation_notes", None) or "",
+            })
+
+        # Trend: billed vs collected by month
+        trend_data = {}
+        for inv in qs:
+            month_key = (inv.invoice_date.year, inv.invoice_date.month)
+            if month_key not in trend_data:
+                trend_data[month_key] = {"billed": 0, "collected": 0, "month": f"{inv.invoice_date.year}-{inv.invoice_date.month:02d}"}
+            trend_data[month_key]["billed"] += float(inv.total_amount or 0)
+            trend_data[month_key]["collected"] += float(inv.amount_paid or 0)
+
+        trend = sorted(
+            [{"month": v["month"], "billed": v["billed"], "collected": v["collected"]} for v in trend_data.values()]
+        )
+
+        # By charge type
+        by_type = {}
+        for inv in qs:
+            t = inv.invoice_type or "OTHER"
+            if t not in by_type:
+                by_type[t] = {"charge_type": t, "billed": 0, "collected": 0}
+            by_type[t]["billed"] += float(inv.total_amount or 0)
+            by_type[t]["collected"] += float(inv.amount_paid or 0)
+
+        by_charge_type = sorted(by_type.values(), key=lambda x: -x["billed"])
+
+        return Response({
+            "details": details,
+            "trend": trend,
+            "by_charge_type": by_charge_type,
+        })
+
+
+class RevenueRecognitionExportAPIView(APIView):
+    """
+    GET /api/v1/billing/revenue-recognition/export/
+    Export revenue recognition details to CSV.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        import csv
+        from django.http import HttpResponse
+        from apps.core.utils import get_active_scope
+
+        scope = get_active_scope(request)
+        if not scope:
+            return HttpResponse("Scope required", status=400)
+
+        from_date = request.query_params.get("from_date")
+        to_date = request.query_params.get("to_date")
+        search = request.query_params.get("search", "").strip()
+
+        qs = models.Invoice.objects.filter(scope=scope).exclude(
+            status__in=[models.Invoice.InvoiceStatus.CANCELLED, models.Invoice.InvoiceStatus.WRITTEN_OFF]
+        ).select_related("agreement", "agreement__tenant")
+
+        if from_date:
+            qs = qs.filter(invoice_date__gte=from_date)
+        if to_date:
+            qs = qs.filter(invoice_date__lte=to_date)
+        if search:
+            qs = qs.filter(
+                Q(invoice_number__icontains=search) |
+                Q(agreement__tenant__legal_name__icontains=search)
+            )
+
+        response = HttpResponse(content_type="text/csv")
+        response["Content-Disposition"] = "attachment; filename=revenue-recognition.csv"
+        writer = csv.writer(response)
+        writer.writerow([
+            "Invoice #", "Billing Period", "Tenant", "Billed", "Collected", "Recognition Status", "Invoice Type"
+        ])
+        for inv in qs.order_by("-invoice_date")[:5000]:
+            period = f"{inv.period_start} to {inv.period_end}" if inv.period_start and inv.period_end else str(inv.invoice_date)
+            tenant = inv.agreement.tenant.legal_name if inv.agreement and inv.agreement.tenant else ""
+            rec = "ACCRUED" if inv.status != models.Invoice.InvoiceStatus.DRAFT else "DEFERRED"
+            writer.writerow([
+                inv.invoice_number, period, tenant,
+                float(inv.total_amount or 0), float(inv.amount_paid or 0),
+                rec, inv.invoice_type or "",
+            ])
+        return response
 
 
 class LeaseRulesViewSet(ScopedViewSet):

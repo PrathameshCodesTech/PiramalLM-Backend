@@ -558,34 +558,12 @@ class TenantScopeViewSet(ModelViewSet):
 
         return qs
 
-# ===================== Permission / Role ViewSets =====================
+# ===================== Permission ViewSet =====================
 
 class PermissionViewSet(ModelViewSet):
     queryset = models.Permission.objects.all()
     serializer_class = serializers.PermissionSerializer
     permission_classes = [IsAuthenticated]
-
-
-class RoleViewSet(ScopedViewSet):
-    queryset = models.Role.objects.all()
-    serializer_class = serializers.RoleSerializer
-
-    def get_serializer_class(self):
-        if self.action == "list":
-            return serializers.RoleListSerializer
-        return serializers.RoleSerializer
-
-    def get_queryset(self):
-        qs = super().get_queryset().select_related("scope")
-
-        # When scope_id is provided, return only roles for that scope (no ancestors)
-        scope_id = self.request.query_params.get("scope_id")
-        if scope_id:
-            try:
-                return models.Role.objects.filter(scope_id=int(scope_id)).order_by("code")
-            except ValueError:
-                pass
-        return qs
 
 
 class RolePermissionViewSet(ModelViewSet):
@@ -723,7 +701,84 @@ class UserViewSet(ModelViewSet):
                 scope_memberships__is_active=True,
             ).distinct()
 
+        # Filter by profile status
+        user_status = self.request.query_params.get("status")
+        if user_status:
+            qs = qs.filter(profile__status__iexact=user_status)
+
+        # Filter by department
+        department = self.request.query_params.get("department")
+        if department:
+            qs = qs.filter(profile__department__iexact=department)
+
+        # Filter by profile role (ADMIN/MANAGER/BROKER/TENANT/VIEWER)
+        profile_role = self.request.query_params.get("role")
+        if profile_role:
+            qs = qs.filter(profile__role__iexact=profile_role)
+
         return qs
+
+    @action(detail=False, methods=["post"], url_path="bulk-action")
+    @transaction.atomic
+    def bulk_action(self, request):
+        """
+        Bulk actions on multiple users.
+        Body: { action: "deactivate"|"activate"|"change_role", user_ids: [1,2,3], role_id: 5 }
+        """
+        action_type = request.data.get("action", "").lower()
+        user_ids = request.data.get("user_ids", [])
+        if not user_ids or not isinstance(user_ids, list):
+            raise ValidationError({"user_ids": "Provide a non-empty list of user IDs."})
+
+        target_users = User.objects.filter(id__in=user_ids)
+        count = target_users.count()
+
+        if action_type == "deactivate":
+            target_users.update(is_active=False)
+            models.UserProfile.objects.filter(user__in=target_users).update(
+                status=models.UserProfile.UserStatus.INACTIVE
+            )
+            for u in target_users:
+                models.UserChangeLog.objects.create(
+                    user=u, changed_by=request.user,
+                    field_changed="status", old_value="", new_value="INACTIVE",
+                )
+        elif action_type == "activate":
+            target_users.update(is_active=True)
+            models.UserProfile.objects.filter(user__in=target_users).update(
+                status=models.UserProfile.UserStatus.ACTIVE
+            )
+            for u in target_users:
+                models.UserChangeLog.objects.create(
+                    user=u, changed_by=request.user,
+                    field_changed="status", old_value="", new_value="ACTIVE",
+                )
+        elif action_type == "change_role":
+            role_id = request.data.get("role_id")
+            if not role_id:
+                raise ValidationError({"role_id": "role_id is required for change_role action."})
+            try:
+                role_obj = models.Role.objects.get(id=role_id)
+            except models.Role.DoesNotExist:
+                raise ValidationError({"role_id": "Role not found."})
+            active_scope = get_active_scope(request)
+            mbrs = models.ScopeMembership.objects.filter(user_id__in=user_ids, is_active=True)
+            if active_scope:
+                mbrs = mbrs.filter(scope=active_scope)
+            mbrs.update(role=role_obj)
+            for u in target_users:
+                models.UserChangeLog.objects.create(
+                    user=u, changed_by=request.user,
+                    field_changed="role", old_value="", new_value=role_obj.name,
+                )
+        else:
+            raise ValidationError({"action": f"Unknown action '{action_type}'."})
+
+        return Response({
+            "action": action_type,
+            "affected_users": count,
+            "message": f"Bulk '{action_type}' applied to {count} user(s).",
+        })
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
@@ -790,6 +845,212 @@ class UserViewSet(ModelViewSet):
             out["membership_id"] = membership.id
 
         return Response(out, status=status.HTTP_201_CREATED)
+
+    # ── User management actions ─────────────────────────────────────────────
+
+    @action(detail=False, methods=["post"], url_path="invite")
+    @transaction.atomic
+    def invite_user(self, request):
+        """
+        Invite a user by email. Creates user account + sends invite token.
+        Body: { email, first_name, last_name, role_id, scope_id, department }
+        """
+        import secrets as _secrets
+        email = request.data.get("email", "").strip().lower()
+        if not email:
+            raise ValidationError({"email": "Email is required."})
+        if User.objects.filter(email__iexact=email).exists():
+            raise ValidationError({"email": "A user with this email already exists."})
+
+        first_name = request.data.get("first_name", "")
+        last_name = request.data.get("last_name", "")
+        department = request.data.get("department", "")
+        scope_id = request.data.get("scope_id")
+        role_id = request.data.get("role_id")
+
+        password = generate_password()
+        username = email.split("@")[0] + "_" + _secrets.token_hex(3)
+        user = User.objects.create_user(
+            username=username,
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            password=password,
+        )
+        invite_token = _secrets.token_urlsafe(32)
+        profile = models.UserProfile.objects.create(
+            user=user,
+            status=models.UserProfile.UserStatus.PENDING,
+            department=department,
+            invite_token=invite_token,
+            invite_accepted=False,
+        )
+        models.UserChangeLog.objects.create(
+            user=user,
+            changed_by=request.user,
+            field_changed="status",
+            old_value="",
+            new_value="PENDING",
+        )
+
+        membership = None
+        if scope_id and role_id:
+            try:
+                scope = models.TenantScope.objects.get(id=scope_id)
+                role_obj = models.Role.objects.get(id=role_id)
+                membership = models.ScopeMembership.objects.create(
+                    user=user, scope=scope, role=role_obj, created_by=request.user
+                )
+            except (models.TenantScope.DoesNotExist, models.Role.DoesNotExist) as e:
+                raise ValidationError(str(e))
+
+        out = serializers.UserDetailSerializer(user).data
+        out["invite_token"] = invite_token
+        out["password_plain"] = password
+        return Response(out, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="reset-password")
+    def reset_password(self, request, pk=None):
+        """Admin: generate a new password for a user and return it."""
+        target_user = self.get_object()
+        new_pass = generate_password()
+        target_user.set_password(new_pass)
+        target_user.save(update_fields=["password"])
+        models.UserChangeLog.objects.create(
+            user=target_user,
+            changed_by=request.user,
+            field_changed="password",
+            old_value="",
+            new_value="[reset]",
+        )
+        return Response({"password_plain": new_pass, "message": "Password reset successfully."})
+
+    @action(detail=True, methods=["post"], url_path="revoke-invitation")
+    def revoke_invitation(self, request, pk=None):
+        """Revoke a pending invite — marks user INACTIVE and clears token."""
+        target_user = self.get_object()
+        profile = getattr(target_user, "profile", None)
+        if not profile:
+            raise ValidationError("User has no profile.")
+        if profile.status != models.UserProfile.UserStatus.PENDING:
+            raise ValidationError("User is not in PENDING state.")
+        profile.status = models.UserProfile.UserStatus.INACTIVE
+        profile.invite_token = ""
+        profile.save(update_fields=["status", "invite_token"])
+        target_user.is_active = False
+        target_user.save(update_fields=["is_active"])
+        models.UserChangeLog.objects.create(
+            user=target_user,
+            changed_by=request.user,
+            field_changed="status",
+            old_value="PENDING",
+            new_value="INACTIVE",
+        )
+        return Response({"message": "Invitation revoked."})
+
+    @action(detail=True, methods=["post"], url_path="set-status")
+    def set_status(self, request, pk=None):
+        """Set user status: ACTIVE / INACTIVE / SUSPENDED."""
+        target_user = self.get_object()
+        new_status = request.data.get("status", "").upper()
+        valid = [c[0] for c in models.UserProfile.UserStatus.choices]
+        if new_status not in valid:
+            raise ValidationError({"status": f"Must be one of {valid}."})
+        profile, _ = models.UserProfile.objects.get_or_create(user=target_user)
+        old_status = profile.status
+        profile.status = new_status
+        profile.save(update_fields=["status"])
+        target_user.is_active = (new_status == models.UserProfile.UserStatus.ACTIVE)
+        target_user.save(update_fields=["is_active"])
+        models.UserChangeLog.objects.create(
+            user=target_user,
+            changed_by=request.user,
+            field_changed="status",
+            old_value=old_status,
+            new_value=new_status,
+        )
+        return Response({"status": new_status, "message": f"User status set to {new_status}."})
+
+    @action(detail=True, methods=["get"], url_path="change-log")
+    def change_log(self, request, pk=None):
+        """Return audit log for this user."""
+        target_user = self.get_object()
+        logs = models.UserChangeLog.objects.filter(user=target_user).order_by("-changed_at")[:50]
+        return Response(serializers.UserChangeLogSerializer(logs, many=True).data)
+
+
+# ===================== Role ViewSet — enhanced =====================
+
+class RoleViewSet(ScopedViewSet):
+    queryset = models.Role.objects.all()
+    serializer_class = serializers.RoleSerializer
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return serializers.RoleListSerializer
+        if self.action in ("create", "update", "partial_update"):
+            return serializers.RoleWriteSerializer
+        return serializers.RoleSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset().select_related("scope", "base_on").prefetch_related(
+            "module_permissions", "role_permissions__permission"
+        )
+        scope_id = self.request.query_params.get("scope_id")
+        if scope_id:
+            try:
+                return models.Role.objects.filter(scope_id=int(scope_id)).order_by("code")
+            except ValueError:
+                pass
+        role_type = self.request.query_params.get("role_type")
+        if role_type:
+            qs = qs.filter(role_type=role_type)
+        role_status = self.request.query_params.get("status")
+        if role_status:
+            qs = qs.filter(status=role_status)
+        return qs
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        """Publish a DRAFT role (make it active/assignable)."""
+        role = self.get_object()
+        if role.status == models.Role.RoleStatus.PUBLISHED:
+            return Response({"detail": "Role is already published."}, status=status.HTTP_400_BAD_REQUEST)
+        role.publish()
+        return Response(serializers.RoleSerializer(role, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"])
+    def duplicate(self, request, pk=None):
+        """Clone this role as a new DRAFT."""
+        original = self.get_object()
+        new_role = models.Role.objects.create(
+            scope=original.scope,
+            name=f"{original.name} (Copy)",
+            code=f"{original.code}-copy-{secrets.token_hex(2)}",
+            description=original.description,
+            role_type=original.role_type,
+            status=models.Role.RoleStatus.DRAFT,
+            base_on=original,
+            approval_cap_amount=original.approval_cap_amount,
+            can_approve_amendments=original.can_approve_amendments,
+            can_approve_waivers=original.can_approve_waivers,
+            can_modify_matrices=original.can_modify_matrices,
+            data_scope_type=original.data_scope_type,
+            data_scope_property_ids=original.data_scope_property_ids,
+            created_by=request.user,
+        )
+        for mp in original.module_permissions.all():
+            models.ModulePermission.objects.create(
+                role=new_role,
+                module=mp.module,
+                can_view=mp.can_view,
+                can_create=mp.can_create,
+                can_edit=mp.can_edit,
+                can_delete=mp.can_delete,
+                can_approve=mp.can_approve,
+            )
+        return Response(serializers.RoleSerializer(new_role, context={"request": request}).data,
+                        status=status.HTTP_201_CREATED)
 
 
 # ===================== Change Password Endpoint =====================

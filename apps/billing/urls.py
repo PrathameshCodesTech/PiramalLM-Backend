@@ -8,10 +8,12 @@ router = DefaultRouter()
 router.register(r"ageing-buckets", views.AgeingBucketViewSet, basename="ageing-bucket")
 router.register(r"ar-rules", views.ARRuleViewSet, basename="ar-rule")
 router.register(r"invoices", views.InvoiceViewSet, basename="invoice")
+router.register(r"invoice-attachments", views.InvoiceAttachmentViewSet, basename="invoice-attachment")
 router.register(r"payments", views.PaymentViewSet, basename="payment")
 router.register(r"credit-notes", views.CreditNoteViewSet, basename="credit-note")
 router.register(r"invoice-schedules", views.InvoiceScheduleViewSet, basename="invoice-schedule")
 router.register(r"ar-summaries", views.ARSummaryViewSet, basename="ar-summary")
+router.register(r"rent-schedule-lines", views.RentScheduleLineViewSet, basename="rent-schedule-line")
 router.register(r"lease-rules", views.LeaseRulesViewSet, basename="lease-rules")
 
 # New viewsets (Tab-based configuration)
@@ -26,4 +28,8 @@ urlpatterns = router.urls + [
     # Bundle endpoints for fetching all config at once
     path("config/", views.BillingConfigBundleView.as_view(), name="billing-config-bundle"),
     path("site/<int:site_id>/config/", views.SiteBillingConfigBundleView.as_view(), name="site-billing-config-bundle"),
+    path("receivables/", views.ReceivablesListAPIView.as_view(), name="receivables-list"),
+    path("rent-schedule-kpis/", views.RentScheduleKPIsAPIView.as_view(), name="rent-schedule-kpis"),
+    path("revenue-recognition/", views.RevenueRecognitionAPIView.as_view(), name="revenue-recognition"),
+    path("revenue-recognition/export/", views.RevenueRecognitionExportAPIView.as_view(), name="revenue-recognition-export"),
 ]

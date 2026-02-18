@@ -808,6 +808,35 @@ class ARGlobalSettings(TenantModel):
         help_text="Maximum percentage for auto-approved credit notes"
     )
 
+    # Accounting & AR (Invoice / Revenue Recognition)
+    revenue_recognition_rule = models.CharField(
+        max_length=30,
+        choices=[
+            ("ACCRUAL_BASIS", "Accrual Basis"),
+            ("CASH_BASIS", "Cash Basis"),
+            ("HYBRID", "Hybrid"),
+        ],
+        default="ACCRUAL_BASIS",
+        blank=True,
+        help_text="How revenue is recognized for accounting"
+    )
+    ar_ageing_bucket = models.ForeignKey(
+        AgeingBucket,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="ar_settings_default",
+        help_text="Default AR ageing bucket mapping (e.g. Current 0-30)"
+    )
+    eligible_for_dunning = models.BooleanField(
+        default=True,
+        help_text="Include in dunning (payment reminder) workflow"
+    )
+    include_in_auto_email_batch = models.BooleanField(
+        default=True,
+        help_text="Include invoices in automated email batch"
+    )
+
     class Meta:
         verbose_name = "AR Global Settings"
         verbose_name_plural = "AR Global Settings"
@@ -1082,6 +1111,10 @@ class InvoiceLineItem(TenantModel):
         decimal_places=2
     )
 
+    # Period (optional; for line-level period when different from invoice)
+    period_start = models.DateField(null=True, blank=True, help_text="Start of charge period for this line")
+    period_end = models.DateField(null=True, blank=True, help_text="End of charge period for this line")
+
     # Reference to unit if applicable
     unit = models.ForeignKey(
         "properties.Unit",
@@ -1277,6 +1310,39 @@ class CreditNote(TenantModel):
         return f"{self.credit_note_number} - {self.amount}"
 
 
+class InvoiceAttachment(TenantModel):
+    """
+    File attachment for an invoice (e.g. terms PDF, receipt).
+    """
+
+    invoice = models.ForeignKey(
+        Invoice,
+        on_delete=models.CASCADE,
+        related_name="attachments"
+    )
+
+    file = models.FileField(
+        upload_to="invoice_attachments/%Y/%m/",
+        help_text="Uploaded file"
+    )
+    filename = models.CharField(
+        max_length=255,
+        help_text="Original filename for display"
+    )
+    file_size = models.PositiveIntegerField(
+        default=0,
+        help_text="File size in bytes"
+    )
+
+    class Meta:
+        verbose_name = "Invoice Attachment"
+        verbose_name_plural = "Invoice Attachments"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.filename} - {self.invoice.invoice_number}"
+
+
 class InvoiceSchedule(TenantModel):
     """
     Scheduled invoice generation rules.
@@ -1419,3 +1485,128 @@ class ARSummary(TenantModel):
 
     def __str__(self):
         return f"AR Summary - {self.agreement.lease_id}"
+
+
+# =============================================================================
+# RENT SCHEDULE (Tab 1 - Rent Schedule & Revenue Recognition)
+# =============================================================================
+
+class RentScheduleLine(TenantModel):
+    """
+    Per-period rent schedule line.
+    Represents a single period charge for a lease (e.g. monthly rent for Jan 2025).
+
+    UI: Rent Schedule List, Detail
+    """
+
+    class ChargeType(models.TextChoices):
+        BASE_RENT = "BASE_RENT", "Base Rent"
+        CAM = "CAM", "CAM"
+        PARKING = "PARKING", "Parking"
+        UTILITY = "UTILITY", "Utility"
+        TAX = "TAX", "Tax"
+        LATE_FEE = "LATE_FEE", "Late Fee"
+        ADJUSTMENT = "ADJUSTMENT", "Adjustment"
+        OTHER = "OTHER", "Other"
+
+    class ScheduleStatus(models.TextChoices):
+        SCHEDULED = "SCHEDULED", "Scheduled"
+        INVOICED = "INVOICED", "Invoiced"
+        PAID = "PAID", "Paid"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    agreement = models.ForeignKey(
+        "leases.Agreement",
+        on_delete=models.CASCADE,
+        related_name="rent_schedule_lines",
+    )
+    unit = models.ForeignKey(
+        "properties.Unit",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="rent_schedule_lines",
+    )
+
+    # Period
+    period_start = models.DateField()
+    period_end = models.DateField()
+
+    # Charge
+    charge_type = models.CharField(
+        max_length=20,
+        choices=ChargeType.choices,
+        default=ChargeType.BASE_RENT,
+    )
+    amount_before_tax = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    gst = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="GST/tax amount",
+    )
+    amount_after_tax = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="amount_before_tax + gst",
+    )
+
+    due_date = models.DateField()
+    status = models.CharField(
+        max_length=20,
+        choices=ScheduleStatus.choices,
+        default=ScheduleStatus.SCHEDULED,
+    )
+
+    # Override / adjustment
+    override_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Manual override of amount_after_tax",
+    )
+    adjustment_reason = models.TextField(blank=True)
+    effective_date = models.DateField(null=True, blank=True)
+
+    escalation_applied = models.BooleanField(default=False)
+    escalation_notes = models.TextField(blank=True)
+
+    notes = models.TextField(blank=True)
+
+    # Link to invoice when invoiced
+    invoice = models.ForeignKey(
+        Invoice,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="rent_schedule_lines",
+    )
+
+    class Meta:
+        verbose_name = "Rent Schedule Line"
+        verbose_name_plural = "Rent Schedule Lines"
+        ordering = ["agreement", "period_start", "period_end"]
+        indexes = [
+            models.Index(fields=["agreement", "period_start"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["due_date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.agreement.lease_id} - {self.period_start} to {self.period_end} ({self.charge_type})"
+
+    def save(self, *args, **kwargs):
+        if self.override_amount is not None:
+            self.amount_after_tax = self.override_amount
+        elif not self.amount_after_tax and self.amount_before_tax:
+            self.amount_after_tax = self.amount_before_tax + (self.gst or Decimal("0"))
+        super().save(*args, **kwargs)

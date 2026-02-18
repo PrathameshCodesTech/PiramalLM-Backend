@@ -114,24 +114,90 @@ class PermissionSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at")
 
 
+class ModulePermissionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.ModulePermission
+        fields = (
+            "id", "module",
+            "can_view", "can_create", "can_edit", "can_delete", "can_approve",
+        )
+
+
 class RoleSerializer(serializers.ModelSerializer):
     scope_name = serializers.CharField(source="scope.name", read_only=True)
     permissions_list = serializers.SerializerMethodField()
+    module_permissions = ModulePermissionSerializer(many=True, read_only=True)
+    base_on_name = serializers.CharField(source="base_on.name", read_only=True, default=None)
 
     class Meta:
         model = models.Role
-        fields = "__all__"
+        fields = (
+            "id", "scope", "scope_name", "name", "code",
+            "description", "role_type", "status", "is_system",
+            "base_on", "base_on_name",
+            # Approval caps
+            "approval_cap_amount", "can_approve_amendments",
+            "can_approve_waivers", "can_modify_matrices",
+            # Data scope
+            "data_scope_type", "data_scope_property_ids",
+            # Relations
+            "permissions_list", "module_permissions",
+            # Audit
+            "created_at", "updated_at", "created_by", "updated_by",
+            "is_active", "deleted_at",
+        )
         read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at")
 
     def get_permissions_list(self, obj):
         return list(obj.permissions.values_list("code", flat=True))
 
 
+class RoleWriteSerializer(serializers.ModelSerializer):
+    """Write serializer — accepts nested module_permissions for bulk upsert."""
+    module_permissions = ModulePermissionSerializer(many=True, required=False)
+
+    class Meta:
+        model = models.Role
+        fields = (
+            "scope", "name", "code", "description", "role_type", "status",
+            "is_system", "base_on",
+            "approval_cap_amount", "can_approve_amendments",
+            "can_approve_waivers", "can_modify_matrices",
+            "data_scope_type", "data_scope_property_ids",
+            "module_permissions",
+        )
+
+    def _save_module_permissions(self, role, mp_data):
+        if mp_data is None:
+            return
+        existing = {mp.module: mp for mp in role.module_permissions.all()}
+        for mp_item in mp_data:
+            module = mp_item["module"]
+            if module in existing:
+                for field in ("can_view", "can_create", "can_edit", "can_delete", "can_approve"):
+                    setattr(existing[module], field, mp_item.get(field, False))
+                existing[module].save()
+            else:
+                models.ModulePermission.objects.create(role=role, **mp_item)
+
+    def create(self, validated_data):
+        mp_data = validated_data.pop("module_permissions", None)
+        role = super().create(validated_data)
+        self._save_module_permissions(role, mp_data)
+        return role
+
+    def update(self, instance, validated_data):
+        mp_data = validated_data.pop("module_permissions", None)
+        role = super().update(instance, validated_data)
+        self._save_module_permissions(role, mp_data)
+        return role
+
+
 class RoleListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for dropdowns."""
     class Meta:
         model = models.Role
-        fields = ("id", "name", "code", "is_system")
+        fields = ("id", "name", "code", "is_system", "role_type", "status")
 
 
 class RolePermissionSerializer(serializers.ModelSerializer):
@@ -159,13 +225,34 @@ class ScopeMembershipSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at")
 
 
+# ===================== UserChangeLog Serializer =====================
+
+class UserChangeLogSerializer(serializers.ModelSerializer):
+    changed_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.UserChangeLog
+        fields = ("id", "field_changed", "old_value", "new_value", "changed_at", "changed_by_name")
+        read_only_fields = fields
+
+    def get_changed_by_name(self, obj):
+        if obj.changed_by:
+            return obj.changed_by.get_full_name() or obj.changed_by.username
+        return "System"
+
+
 # ===================== UserProfile Serializers =====================
 
 class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.UserProfile
-        fields = "__all__"
-        read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at")
+        fields = (
+            "id", "user", "role", "status", "department",
+            "phone", "avatar", "profile_json",
+            "invite_token", "invite_accepted",
+            "created_at", "updated_at", "is_active",
+        )
+        read_only_fields = ("id", "user", "invite_token", "created_at", "updated_at", "is_active")
 
 
 # ===================== User Serializers =====================
@@ -187,27 +274,41 @@ class UserSerializer(serializers.ModelSerializer):
 class UserListSerializer(serializers.ModelSerializer):
     """User list with memberships count and scope info."""
     role = serializers.SerializerMethodField()
+    department = serializers.SerializerMethodField()
+    user_status = serializers.SerializerMethodField()
     memberships_count = serializers.SerializerMethodField()
     full_name = serializers.SerializerMethodField()
     memberships = serializers.SerializerMethodField()
+    last_active = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = (
             "id", "username", "email", "first_name", "last_name",
-            "is_active", "role", "memberships_count", "full_name",
-            "memberships",
+            "is_active", "role", "department", "user_status",
+            "memberships_count", "full_name", "memberships", "last_active",
         )
 
     def get_role(self, obj):
         profile = getattr(obj, "profile", None)
         return profile.role if profile else None
 
+    def get_department(self, obj):
+        profile = getattr(obj, "profile", None)
+        return profile.department if profile else ""
+
+    def get_user_status(self, obj):
+        profile = getattr(obj, "profile", None)
+        return profile.status if profile else "ACTIVE"
+
     def get_memberships_count(self, obj):
         return obj.scope_memberships.filter(is_active=True).count()
 
     def get_full_name(self, obj):
         return obj.get_full_name() or obj.username
+
+    def get_last_active(self, obj):
+        return getattr(obj, "last_login", None)
 
     def get_memberships(self, obj):
         return [
@@ -222,17 +323,18 @@ class UserListSerializer(serializers.ModelSerializer):
 
 
 class UserDetailSerializer(serializers.ModelSerializer):
-    """Full user detail with profile and memberships."""
+    """Full user detail with profile, memberships, and recent change log."""
     role = serializers.SerializerMethodField()
     profile = serializers.SerializerMethodField()
     memberships = serializers.SerializerMethodField()
+    recent_changes = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = (
             "id", "username", "email", "first_name", "last_name",
-            "is_active", "is_staff", "is_superuser", "date_joined",
-            "role", "profile", "memberships"
+            "is_active", "is_staff", "is_superuser", "date_joined", "last_login",
+            "role", "profile", "memberships", "recent_changes",
         )
 
     def get_role(self, obj):
@@ -245,7 +347,11 @@ class UserDetailSerializer(serializers.ModelSerializer):
             return {
                 "id": profile.id,
                 "role": profile.role,
+                "status": profile.status,
+                "department": profile.department,
                 "phone": profile.phone,
+                "avatar": profile.avatar.url if profile.avatar else None,
+                "invite_accepted": profile.invite_accepted,
                 "profile_json": profile.profile_json,
             }
         return None
@@ -263,6 +369,10 @@ class UserDetailSerializer(serializers.ModelSerializer):
             }
             for m in memberships
         ]
+
+    def get_recent_changes(self, obj):
+        logs = models.UserChangeLog.objects.filter(user=obj).order_by("-changed_at")[:5]
+        return UserChangeLogSerializer(logs, many=True).data
 
 
 class UserCreateSerializer(serializers.ModelSerializer):

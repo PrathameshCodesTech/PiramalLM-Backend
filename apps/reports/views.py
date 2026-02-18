@@ -112,10 +112,46 @@ class DashboardViewSet(viewsets.ViewSet):
         return Response(service.get_occupancy_timeline())
     
     @action(detail=False, methods=['get'])
+    def alerts(self, request):
+        """
+        Get dashboard alerts (lease expiring, rent overdue, high vacancy).
+        """
+        params = request.query_params
+        service = DashboardService(request, params)
+        return Response(service.get_alerts())
+
+    @action(detail=False, methods=['get'])
+    def quick_actions(self, request):
+        """
+        Get quick action counts (active leases, drafts, disputes, overdue).
+        """
+        params = request.query_params
+        service = DashboardService(request, params)
+        return Response(service.get_quick_actions())
+
+    @action(detail=False, methods=['get'])
+    def properties(self, request):
+        """
+        Get properties summary table with occupancy and area.
+        """
+        params = request.query_params
+        service = DashboardService(request, params)
+        return Response(service.get_properties_table())
+
+    @action(detail=False, methods=['get'])
+    def portfolio_stats(self, request):
+        """
+        Get portfolio-level stats (NOI, Avg Days Vacant, etc.).
+        """
+        params = request.query_params
+        service = DashboardService(request, params)
+        return Response(service.get_portfolio_stats())
+
+    @action(detail=False, methods=['get'])
     def filters(self, request):
         """
         Get filter options.
-        
+
         Returns:
             Available filter options
         """
