@@ -224,6 +224,86 @@ class EscalationTemplate(TenantModel):
         return base_rent
 
 
+# =============================================================================
+# AGREEMENT STRUCTURE (Document Sections Template)
+# =============================================================================
+
+class AgreementStructure(TenantModel):
+    """
+    Reusable template defining the document structure for lease agreements.
+    Sections define how clauses are grouped (e.g. Part 1: Rent & Payment).
+
+    UI: Agreement Structure / Sections configuration
+    """
+
+    name = models.CharField(
+        max_length=255,
+        help_text="Structure name e.g., 'Standard Commercial Lease'"
+    )
+    description = models.TextField(
+        blank=True,
+        help_text="Description of the structure"
+    )
+    is_default = models.BooleanField(
+        default=False,
+        help_text="Use as default for new agreements"
+    )
+
+    class Meta:
+        verbose_name = "Agreement Structure"
+        verbose_name_plural = "Agreement Structures"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scope", "name"],
+                name="unique_agreement_structure_name_per_scope",
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class AgreementSection(TenantModel):
+    """
+    Section within an agreement structure (e.g. Part 1: Rent & Payment).
+    Defines the order and grouping of clauses in the final document.
+    """
+
+    structure = models.ForeignKey(
+        AgreementStructure,
+        on_delete=models.CASCADE,
+        related_name="sections",
+    )
+    name = models.CharField(
+        max_length=255,
+        help_text="Section title e.g., 'Rent & Payment'"
+    )
+    description = models.TextField(blank=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    parent = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="children",
+    )
+
+    class Meta:
+        verbose_name = "Agreement Section"
+        verbose_name_plural = "Agreement Sections"
+        ordering = ["structure", "sort_order", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["structure", "name"],
+                name="unique_section_name_per_structure",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.structure.name} / {self.name}"
+
+
 class Agreement(TenantModel):
     """
     Main lease agreement model.
@@ -283,6 +363,15 @@ class Agreement(TenantModel):
     # Reference
     ref_code = models.CharField(max_length=50, blank=True)
     notes = models.TextField(blank=True)
+
+    # Document structure (optional - defines how clauses are grouped)
+    structure = models.ForeignKey(
+        AgreementStructure,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="agreements",
+    )
 
     class Meta:
         verbose_name = "Lease Agreement"

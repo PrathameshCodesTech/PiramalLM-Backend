@@ -281,7 +281,7 @@ class ClauseDocumentListSerializer(serializers.ModelSerializer):
 class ClauseDocumentUploadSerializer(serializers.ModelSerializer):
     """Serializer for uploading documents with optional clause linking."""
     link_to_clauses = serializers.ListField(
-        child=serializers.UUIDField(),
+        child=serializers.IntegerField(),
         required=False,
         write_only=True
     )
@@ -358,4 +358,4 @@ class ClauseUsageCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.ClauseUsage
-        fields = ("clause", "clause_version", "agreement", "custom_config", "custom_body_text")
+        fields = ("clause", "clause_version", "agreement", "section", "custom_config", "custom_body_text")

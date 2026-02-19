@@ -1701,12 +1701,12 @@ class RentScheduleLineViewSet(ScopedViewSet):
         from apps.leases.models import Agreement
         for aid in agreement_ids:
             try:
-                ag = Agreement.objects.select_related("billing").get(id=aid, scope=scope)
+                ag = Agreement.objects.select_related("financials").get(id=aid, scope=scope)
             except Agreement.DoesNotExist:
                 continue
             amount = 0
-            if hasattr(ag, "billing") and ag.billing and ag.billing.base_rent_monthly is not None:
-                amount = ag.billing.base_rent_monthly
+            if hasattr(ag, "financials") and ag.financials and ag.financials.base_rent_monthly is not None:
+                amount = ag.financials.base_rent_monthly
             due_date = period_end  # Simple: due at period end
             line, created_flag = models.RentScheduleLine.objects.get_or_create(
                 scope=scope,

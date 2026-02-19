@@ -158,7 +158,7 @@ def me(request):
     # Get memberships (filtered by boundary if applicable)
     memberships = models.ScopeMembership.objects.filter(
         user=user, is_active=True
-    ).select_related("scope", "role", "scope__org", "scope__company", "scope__entity", "scope__site")
+    ).select_related("scope", "role", "scope__org", "scope__company", "scope__entity", "scope__site").prefetch_related("role__module_permissions")
 
     if boundary_scope_ids is not None:
         memberships = memberships.filter(scope_id__in=boundary_scope_ids)
@@ -188,6 +188,18 @@ def me(request):
             entry["org"] = {"id": m.scope.entity.company.org.id, "name": m.scope.entity.company.org.name}
         if m.scope.site:
             entry["site"] = {"id": m.scope.site.id, "name": m.scope.site.name}
+
+        # Add role's module permissions (for frontend sidebar/route gating)
+        module_permissions = {}
+        for mp in m.role.module_permissions.all():
+            module_permissions[mp.module] = {
+                "can_view": mp.can_view,
+                "can_create": mp.can_create,
+                "can_edit": mp.can_edit,
+                "can_delete": mp.can_delete,
+                "can_approve": mp.can_approve,
+            }
+        entry["module_permissions"] = module_permissions
 
         membership_data.append(entry)
 
@@ -993,15 +1005,24 @@ class RoleViewSet(ScopedViewSet):
         return serializers.RoleSerializer
 
     def get_queryset(self):
-        qs = super().get_queryset().select_related("scope", "base_on").prefetch_related(
-            "module_permissions", "role_permissions__permission"
-        )
+        # Fast path: explicit scope_id bypasses X-Scope-ID auth so admins can
+        # query roles for any scope (e.g. user-create wizard scope/role picker).
         scope_id = self.request.query_params.get("scope_id")
         if scope_id:
             try:
-                return models.Role.objects.filter(scope_id=int(scope_id)).order_by("code")
+                return (
+                    models.Role.objects
+                    .filter(scope_id=int(scope_id))
+                    .select_related("scope", "base_on")
+                    .prefetch_related("module_permissions", "role_permissions__permission")
+                    .order_by("code")
+                )
             except ValueError:
                 pass
+
+        qs = super().get_queryset().select_related("scope", "base_on").prefetch_related(
+            "module_permissions", "role_permissions__permission"
+        )
         role_type = self.request.query_params.get("role_type")
         if role_type:
             qs = qs.filter(role_type=role_type)

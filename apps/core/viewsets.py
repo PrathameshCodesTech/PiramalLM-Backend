@@ -76,9 +76,14 @@ class ScopedViewSet(ModelViewSet):
         When hierarchy_aware=True, uses get_scope_filter so Org/Company users
         see data from child scopes (Entity, Site). When hierarchy_aware=False,
         uses exact scope match via for_scope if available.
+        Superusers without X-Scope-ID (scope=None) see all records.
         """
         queryset = super().get_queryset()
         scope = self.get_active_scope()
+
+        # Superuser without X-Scope-ID → full unscoped access
+        if scope is None:
+            return queryset
 
         # Exact scope only (e.g. ExactScopedViewSet): use for_scope if available
         if not self.hierarchy_aware and hasattr(queryset, "for_scope"):
@@ -92,10 +97,15 @@ class ScopedViewSet(ModelViewSet):
         """
         Validate that user has permission to create/modify in target scope.
         User can only create in their scope or child scopes.
+        Superusers (scope=None) can write to any scope.
         """
         from apps.accounts.models import TenantScope
 
         active_scope = self.get_active_scope()
+
+        # Superuser without X-Scope-ID → allow write to any scope
+        if active_scope is None:
+            return True
 
         # Same scope - always allowed
         if target_scope.id == active_scope.id:
@@ -139,6 +149,10 @@ class ScopedViewSet(ModelViewSet):
         else:
             # Use header scope
             scope = self.get_active_scope()
+            if scope is None:
+                raise ValidationError({
+                    "scope": "Scope is required. Provide 'scope' in the request body or set X-Scope-ID header."
+                })
             serializer.save(scope=scope)
 
     def perform_update(self, serializer):

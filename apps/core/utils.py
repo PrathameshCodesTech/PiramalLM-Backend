@@ -37,6 +37,10 @@ def get_active_scope(request):
             )
         return scope
 
+    # Superuser without X-Scope-ID → allow unscoped (full) access
+    if user.is_superuser:
+        return None
+
     raise PermissionDenied(
         "No permission context (scope) set. Send the X-Scope-ID header with a scope id you have access to."
     )

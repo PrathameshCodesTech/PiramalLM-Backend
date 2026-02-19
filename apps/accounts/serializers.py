@@ -194,10 +194,13 @@ class RoleWriteSerializer(serializers.ModelSerializer):
 
 
 class RoleListSerializer(serializers.ModelSerializer):
-    """Lightweight serializer for dropdowns."""
+    """Lightweight serializer for dropdowns — includes scope context for labelling."""
+    scope_name = serializers.CharField(source="scope.name", read_only=True)
+    scope_type = serializers.CharField(source="scope.scope_type", read_only=True)
+
     class Meta:
         model = models.Role
-        fields = ("id", "name", "code", "is_system", "role_type", "status")
+        fields = ("id", "name", "code", "is_system", "role_type", "status", "scope_name", "scope_type")
 
 
 class RolePermissionSerializer(serializers.ModelSerializer):

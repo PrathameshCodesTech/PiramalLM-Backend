@@ -12,6 +12,90 @@ from . import models
 class EscalationTemplateSerializer(serializers.ModelSerializer):
     """Full serializer for EscalationTemplate create/update."""
 
+    def validate(self, attrs):
+        instance = self.instance
+
+        def get_value(field, default=None):
+            if field in attrs:
+                return attrs.get(field)
+            if instance is not None:
+                return getattr(instance, field)
+            return default
+
+        escalation_type = get_value(
+            "escalation_type",
+            models.EscalationTemplate.EscalationType.FIXED_PERCENT,
+        )
+        escalation_percentage = get_value("escalation_percentage")
+        index_name = (get_value("index_name") or "").strip()
+        index_base_value = get_value("index_base_value")
+        step_schedule = get_value("step_schedule", [])
+        cap_percentage = get_value("cap_percentage")
+        floor_percentage = get_value("floor_percentage")
+
+        errors = {}
+
+        if escalation_type == models.EscalationTemplate.EscalationType.FIXED_PERCENT:
+            if escalation_percentage is None:
+                errors["escalation_percentage"] = "Escalation % is required for FIXED_PERCENT templates."
+            attrs["index_name"] = ""
+            attrs["index_base_value"] = None
+            attrs["step_schedule"] = []
+
+        elif escalation_type == models.EscalationTemplate.EscalationType.INDEX_LINKED:
+            if not index_name:
+                errors["index_name"] = "Index name is required for INDEX_LINKED templates."
+            if index_base_value is None:
+                errors["index_base_value"] = "Index base value is required for INDEX_LINKED templates."
+            attrs["index_name"] = index_name
+            attrs["escalation_percentage"] = None
+            attrs["step_schedule"] = []
+
+        elif escalation_type == models.EscalationTemplate.EscalationType.STEP_WISE:
+            if not isinstance(step_schedule, list) or len(step_schedule) == 0:
+                errors["step_schedule"] = "Provide at least one step for STEP_WISE templates."
+            else:
+                parsed_steps = []
+                years_seen = set()
+                for idx, step in enumerate(step_schedule):
+                    if not isinstance(step, dict):
+                        errors["step_schedule"] = f"Step #{idx + 1} must be an object."
+                        continue
+                    try:
+                        year = int(step.get("year"))
+                    except (TypeError, ValueError):
+                        errors["step_schedule"] = f"Step #{idx + 1}: 'year' must be an integer."
+                        continue
+                    try:
+                        percentage = float(step.get("percentage"))
+                    except (TypeError, ValueError):
+                        errors["step_schedule"] = f"Step #{idx + 1}: 'percentage' must be a number."
+                        continue
+
+                    if year < 1:
+                        errors["step_schedule"] = f"Step #{idx + 1}: 'year' must be >= 1."
+                    if percentage < 0 or percentage > 100:
+                        errors["step_schedule"] = f"Step #{idx + 1}: 'percentage' must be between 0 and 100."
+                    if year in years_seen:
+                        errors["step_schedule"] = f"Duplicate year '{year}' in step schedule."
+                    years_seen.add(year)
+                    parsed_steps.append({"year": year, "percentage": percentage})
+
+                if "step_schedule" not in errors:
+                    attrs["step_schedule"] = sorted(parsed_steps, key=lambda x: x["year"])
+
+            attrs["escalation_percentage"] = None
+            attrs["index_name"] = ""
+            attrs["index_base_value"] = None
+
+        if cap_percentage is not None and floor_percentage is not None and floor_percentage > cap_percentage:
+            errors["floor_percentage"] = "Floor % cannot be greater than Cap %."
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        return attrs
+
     class Meta:
         model = models.EscalationTemplate
         fields = "__all__"
@@ -42,6 +126,83 @@ class EscalationTemplateDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.EscalationTemplate
         fields = "__all__"
+
+
+# ===================== Agreement Structure Serializers =====================
+
+class AgreementSectionSerializer(serializers.ModelSerializer):
+    """Serializer for AgreementSection."""
+
+    class Meta:
+        model = models.AgreementSection
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+
+class AgreementSectionListSerializer(serializers.ModelSerializer):
+    """Lightweight list serializer for sections."""
+
+    class Meta:
+        model = models.AgreementSection
+        fields = ("id", "name", "description", "sort_order", "parent")
+
+
+class AgreementSectionTreeSerializer(serializers.ModelSerializer):
+    """Recursive serializer for section tree."""
+    children = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.AgreementSection
+        fields = ("id", "name", "description", "sort_order", "parent", "children")
+
+    def get_children(self, obj):
+        children = obj.children.all().order_by("sort_order", "name")
+        return AgreementSectionTreeSerializer(children, many=True).data
+
+
+class AgreementStructureSerializer(serializers.ModelSerializer):
+    """Full serializer for AgreementStructure."""
+
+    class Meta:
+        model = models.AgreementStructure
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+
+class AgreementStructureListSerializer(serializers.ModelSerializer):
+    """List serializer for AgreementStructure."""
+    sections_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.AgreementStructure
+        fields = ("id", "name", "description", "is_default", "sections_count", "scope")
+
+    def get_sections_count(self, obj):
+        return obj.sections.count()
+
+
+class AgreementStructureDetailSerializer(serializers.ModelSerializer):
+    """Detail serializer with nested sections."""
+    sections = AgreementSectionTreeSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = models.AgreementStructure
+        fields = "__all__"
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Only include root sections (parent is null) in tree
+        data["sections"] = AgreementSectionTreeSerializer(
+            instance.sections.filter(parent__isnull=True).order_by("sort_order", "name"),
+            many=True
+        ).data
+        return data
 
 
 # ===================== Term Serializers =====================

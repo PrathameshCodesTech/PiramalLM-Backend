@@ -301,6 +301,14 @@ class ClauseUsage(TenantModel):
         on_delete=models.CASCADE,
         related_name="clause_usages"
     )
+    section = models.ForeignKey(
+        "leases.AgreementSection",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="clause_usages",
+        help_text="Section within agreement structure where this clause appears",
+    )
 
     # Override config for this specific usage
     custom_config = models.JSONField(

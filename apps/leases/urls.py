@@ -7,6 +7,10 @@ router = DefaultRouter()
 # Escalation templates (master data - inheritable)
 router.register(r"escalation-templates", views.EscalationTemplateViewSet, basename="escalation-template")
 
+# Agreement structure & sections
+router.register(r"agreement-structures", views.AgreementStructureViewSet, basename="agreement-structure")
+router.register(r"agreement-sections", views.AgreementSectionViewSet, basename="agreement-section")
+
 # Core lease endpoints
 router.register(r"agreements", views.AgreementViewSet, basename="agreement")
 router.register(r"allocations", views.UnitAllocationViewSet, basename="allocation")

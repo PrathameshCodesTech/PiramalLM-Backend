@@ -105,17 +105,20 @@ class EscalationTemplateViewSet(InheritableScopedViewSet):
             scope=scope,
             name=f"{original.name} (Copy)",
             description=original.description,
-            escalation_type=original.escalation_type,
-            frequency=original.frequency,
-            fixed_percent=original.fixed_percent,
-            index_type=original.index_type,
-            base_value=original.base_value,
-            cap_percent=original.cap_percent,
-            floor_percent=original.floor_percent,
-            rounding_rule=original.rounding_rule,
-            steps_json=original.steps_json,
             applicability=original.applicability,
-            notes=original.notes,
+            escalation_type=original.escalation_type,
+            escalation_percentage=original.escalation_percentage,
+            index_name=original.index_name,
+            index_base_value=original.index_base_value,
+            step_schedule=original.step_schedule,
+            frequency=original.frequency,
+            first_escalation_logic=original.first_escalation_logic,
+            first_escalation_months=original.first_escalation_months,
+            rounding_rule=original.rounding_rule,
+            cap_percentage=original.cap_percentage,
+            floor_percentage=original.floor_percentage,
+            apply_to_cam=original.apply_to_cam,
+            apply_to_parking=original.apply_to_parking,
             status=models.EscalationTemplate.TemplateStatus.DRAFT,
             created_by=request.user
         )
@@ -124,6 +127,120 @@ class EscalationTemplateViewSet(InheritableScopedViewSet):
             serializers.EscalationTemplateSerializer(cloned).data,
             status=status.HTTP_201_CREATED
         )
+
+
+# =============================================================================
+# AGREEMENT STRUCTURE VIEWSETS
+# =============================================================================
+
+class AgreementStructureViewSet(InheritableScopedViewSet):
+    """
+    ViewSet for agreement structures (document section templates).
+
+    Endpoints:
+    - GET /agreement-structures/ - List all structures
+    - POST /agreement-structures/ - Create structure
+    - GET /agreement-structures/{id}/ - Get structure with sections
+    - PATCH /agreement-structures/{id}/ - Update structure
+    - DELETE /agreement-structures/{id}/ - Delete structure
+    - GET /agreement-structures/tree/ - Get structures with section tree
+    """
+
+    queryset = models.AgreementStructure.objects.all()
+    serializer_class = serializers.AgreementStructureSerializer
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return serializers.AgreementStructureListSerializer
+        if self.action == "retrieve":
+            return serializers.AgreementStructureDetailSerializer
+        return serializers.AgreementStructureSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        search = self.request.query_params.get("q")
+        if search:
+            queryset = queryset.filter(name__icontains=search)
+        return queryset.prefetch_related("sections")
+
+    def perform_create(self, serializer):
+        scope = self.get_active_scope()
+        instance = serializer.save(scope=scope, created_by=self.request.user)
+        if instance.is_default:
+            models.AgreementStructure.objects.filter(
+                scope=scope
+            ).exclude(pk=instance.pk).update(is_default=False)
+
+    def perform_update(self, serializer):
+        instance = serializer.save(updated_by=self.request.user)
+        if instance.is_default:
+            models.AgreementStructure.objects.filter(
+                scope=instance.scope
+            ).exclude(pk=instance.pk).update(is_default=False)
+
+    @action(detail=False, methods=["get"])
+    def tree(self, request):
+        """List structures with full section tree."""
+        queryset = self.get_queryset()
+        serializer = serializers.AgreementStructureDetailSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+
+class AgreementSectionViewSet(InheritableScopedViewSet):
+    """
+    ViewSet for agreement sections within a structure.
+
+    Endpoints:
+    - GET /agreement-sections/ - List sections (filter by structure)
+    - POST /agreement-sections/ - Create section
+    - GET /agreement-sections/{id}/ - Get section details
+    - PATCH /agreement-sections/{id}/ - Update section
+    - DELETE /agreement-sections/{id}/ - Delete section
+    """
+
+    queryset = models.AgreementSection.objects.all()
+    serializer_class = serializers.AgreementSectionSerializer
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return serializers.AgreementSectionListSerializer
+        if self.action == "tree":
+            return serializers.AgreementSectionTreeSerializer
+        return serializers.AgreementSectionSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        structure_id = self.request.query_params.get("structure")
+        if structure_id:
+            queryset = queryset.filter(structure_id=structure_id)
+        parent_id = self.request.query_params.get("parent_id")
+        if parent_id:
+            if parent_id in ("null", "root", ""):
+                queryset = queryset.filter(parent__isnull=True)
+            else:
+                queryset = queryset.filter(parent_id=parent_id)
+        return queryset.select_related("structure", "parent")
+
+    def perform_create(self, serializer):
+        scope = self.get_active_scope()
+        serializer.save(scope=scope, created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+    @action(detail=False, methods=["get"])
+    def tree(self, request):
+        """Get section tree for a structure."""
+        structure_id = request.query_params.get("structure")
+        if not structure_id:
+            return Response({"detail": "structure query param required"}, status=status.HTTP_400_BAD_REQUEST)
+        # Keep inheritance/scope visibility from InheritableScopedViewSet.
+        root_sections = self.get_queryset().filter(
+            structure_id=structure_id,
+            parent__isnull=True
+        ).order_by("sort_order", "name")
+        serializer = serializers.AgreementSectionTreeSerializer(root_sections, many=True)
+        return Response(serializer.data)
 
 
 # =============================================================================
@@ -668,17 +785,76 @@ class LeaseAmendmentViewSet(ScopedViewSet):
 
     @action(detail=True, methods=["post"])
     def submit(self, request, pk=None):
-        """Submit amendment for review."""
+        """Submit amendment for review. Auto-creates approval steps from matching ApprovalRule if found."""
+        from apps.approvals.models import ApprovalRule
+        from datetime import timedelta
+
         amendment = self.get_object()
         if amendment.approval_status != models.LeaseAmendment.ApprovalStatus.DRAFT:
             return Response(
                 {"error": "Only draft amendments can be submitted"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        # Derive lease params from agreement for ApprovalRule matching
+        agreement = amendment.agreement
+        agreement = models.Agreement.objects.select_related(
+            "term_dates", "financials", "tenant"
+        ).prefetch_related().get(pk=agreement.pk)
+
+        lease_value = None
+        if hasattr(agreement, "financials") and agreement.financials:
+            fin = agreement.financials
+            if fin.annual_rent is not None and fin.annual_rent > 0:
+                lease_value = float(fin.annual_rent)
+            elif fin.base_rent_monthly is not None and fin.base_rent_monthly > 0:
+                lease_value = float(fin.base_rent_monthly) * 12
+
+        tenant_type = None  # TenantCompany doesn't have tenant_type; rules with empty tenant_types still match
+
+        lease_term_months = None
+        if hasattr(agreement, "term_dates") and agreement.term_dates:
+            td = agreement.term_dates
+            if td.initial_term_months is not None:
+                lease_term_months = td.initial_term_months
+            elif td.commencement_date and td.expiry_date:
+                delta = td.expiry_date - td.commencement_date
+                lease_term_months = max(1, delta.days // 30)
+
+        # Find matching active ApprovalRule (same logic as Simulator)
+        scope_ids = list(amendment.scope.get_child_scopes().values_list("id", flat=True))
+        matched_rule = None
+        for rule in ApprovalRule.objects.filter(
+            scope_id__in=scope_ids,
+            status=ApprovalRule.Status.ACTIVE,
+            is_active=True,
+        ).prefetch_related("levels__role"):
+            if rule.matches(lease_value, tenant_type, lease_term_months):
+                matched_rule = rule
+                break
+
+        # Create AmendmentApproval steps from matched rule
+        if matched_rule:
+            levels = list(matched_rule.levels.order_by("level"))
+            today = timezone.now().date()
+            for lvl in levels:
+                due_date = today + timedelta(hours=lvl.sla_hours) if lvl.sla_hours else None
+                models.AmendmentApproval.objects.create(
+                    scope=amendment.scope,
+                    amendment=amendment,
+                    step_order=lvl.level,
+                    step_name=f"L{lvl.level} - {lvl.role.name}",
+                    step_description=f"Approval required from {lvl.role.name} ({lvl.sla_hours}h SLA)",
+                    approver_role=lvl.role.name,
+                    status=models.AmendmentApproval.ApprovalStepStatus.PENDING,
+                    due_date=due_date,
+                    created_by=request.user,
+                )
+
         amendment.approval_status = models.LeaseAmendment.ApprovalStatus.PENDING_REVIEW
         amendment.updated_by = request.user
         amendment.save()
-        return Response(serializers.LeaseAmendmentSerializer(amendment).data)
+        return Response(serializers.LeaseAmendmentDetailSerializer(amendment).data)
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
@@ -1121,6 +1297,21 @@ class LeaseClauseConfigBundleView(ScopedViewSet):
             return Response(self._build_clause_config_response(agreement))
 
         else:  # PATCH
+            def sanitize_for_model(data, model_class):
+                """Convert empty strings to None for numeric/date fields that accept null."""
+                if not isinstance(data, dict):
+                    return data
+                data = dict(data)
+                for field in model_class._meta.get_fields():
+                    if not hasattr(field, "null"):
+                        continue
+                    if field.name not in data or data[field.name] != "":
+                        continue
+                    # Only convert "" to None for fields that explicitly allow null
+                    if getattr(field, "null", False) is True:
+                        data[field.name] = None
+                return data
+
             # Update clause configs
             for key, model_class in [
                 ("renewal_option", models.LeaseRenewalOption),
@@ -1131,11 +1322,12 @@ class LeaseClauseConfigBundleView(ScopedViewSet):
                 ("termination", models.LeaseTermination),
             ]:
                 if key in request.data:
-                    config_data = request.data[key]
+                    config_data = dict(request.data[key])
                     # Remove read-only fields
                     for field in ["id", "scope", "agreement", "created_at", "updated_at",
                                   "created_by", "updated_by", "is_active", "deleted_at"]:
                         config_data.pop(field, None)
+                    config_data = sanitize_for_model(config_data, model_class)
 
                     model_class.objects.update_or_create(
                         agreement=agreement,

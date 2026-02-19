@@ -25,6 +25,13 @@ class Company(AuditModel):
     org = models.ForeignKey(Org, on_delete=models.CASCADE, related_name="companies")
     name = models.CharField(max_length=200)
     code = models.SlugField(max_length=80)
+    legal_name = models.CharField(max_length=300, blank=True, default="")
+    registration_number = models.CharField(max_length=100, blank=True, default="")
+    tax_id = models.CharField(max_length=100, blank=True, default="")
+    address = models.TextField(blank=True, default="")
+    city = models.CharField(max_length=100, blank=True, default="")
+    state = models.CharField(max_length=100, blank=True, default="")
+    country = models.CharField(max_length=100, blank=True, default="")
 
     class Meta:
         constraints = [
@@ -39,6 +46,13 @@ class Entity(AuditModel):
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="entities")
     name = models.CharField(max_length=200)
     code = models.SlugField(max_length=80)
+    legal_name = models.CharField(max_length=300, blank=True, default="")
+    registration_number = models.CharField(max_length=100, blank=True, default="")
+    tax_id = models.CharField(max_length=100, blank=True, default="")
+    address = models.TextField(blank=True, default="")
+    city = models.CharField(max_length=100, blank=True, default="")
+    state = models.CharField(max_length=100, blank=True, default="")
+    country = models.CharField(max_length=100, blank=True, default="")
 
     class Meta:
         constraints = [

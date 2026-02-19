@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from apps.approvals.models import ApprovalLevel, ApprovalRule, ApprovalRuleLog
+from apps.accounts.models import TenantScope
 
 
 # ── ApprovalRuleLog ────────────────────────────────────────────────────────
@@ -52,7 +53,7 @@ class ApprovalLevelWriteSerializer(serializers.ModelSerializer):
 class ApprovalRuleSerializer(serializers.ModelSerializer):
     """Full serializer — includes nested levels and logs."""
     levels = ApprovalLevelSerializer(many=True, read_only=True)
-    logs = ApprovalRuleLogSerializer(many=True, read_only=True, source="logs")
+    logs = ApprovalRuleLogSerializer(many=True, read_only=True)
     label = serializers.SerializerMethodField()
     escalate_to_role_name = serializers.CharField(
         source="escalate_to_role.name", read_only=True, default=None
@@ -136,8 +137,13 @@ class ApprovalRuleWriteSerializer(serializers.ModelSerializer):
     """
     Write serializer — accepts nested levels for create/update.
     Levels are replaced atomically on each save.
+    Scope is optional here — ScopedViewSet.perform_create injects it from the X-Scope-ID header.
     """
     levels = ApprovalLevelWriteSerializer(many=True, required=False)
+    scope = serializers.PrimaryKeyRelatedField(
+        queryset=TenantScope.objects.all(),
+        required=False,
+    )
 
     class Meta:
         model = ApprovalRule
