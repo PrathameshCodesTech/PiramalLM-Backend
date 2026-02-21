@@ -318,6 +318,9 @@ class FloorSerializer(serializers.ModelSerializer):
         data = super().to_representation(instance)
         data["remaining_total_area_sqft"] = self.get_remaining_total_area_sqft(instance)
         data["remaining_leasable_area_sqft"] = self.get_remaining_leasable_area_sqft(instance)
+        from apps.leases.models import UnitAllocation
+        alloc = UnitAllocation.objects.filter(floor=instance, is_active=True).select_related("agreement").first()
+        data["current_lease_id"] = alloc.agreement_id if alloc else None
         return data
 
     class Meta:
@@ -384,6 +387,13 @@ class UnitSerializer(serializers.ModelSerializer):
                     )
 
         return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        from apps.leases.models import UnitAllocation
+        alloc = UnitAllocation.objects.filter(unit=instance, is_active=True).select_related("agreement").first()
+        data["current_lease_id"] = alloc.agreement_id if alloc else None
+        return data
 
     class Meta:
         model = models.Unit

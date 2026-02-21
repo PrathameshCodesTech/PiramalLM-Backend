@@ -262,9 +262,10 @@ class InheritableScopedViewSet(ScopedViewSet):
         """
         Build Q filter for upward (inheritable) scope filtering.
         Returns configs from current scope + all ancestor scopes.
+        Records with scope=None are treated as global and visible to everyone.
         """
         ancestor_ids = self.get_ancestor_scope_ids(scope)
-        return Q(scope_id__in=ancestor_ids)
+        return Q(scope_id__in=ancestor_ids) | Q(scope__isnull=True)
 
     def get_queryset(self):
         """
@@ -273,6 +274,10 @@ class InheritableScopedViewSet(ScopedViewSet):
         """
         queryset = super(ScopedViewSet, self).get_queryset()  # Skip ScopedViewSet.get_queryset
         scope = self.get_active_scope()
+
+        # Superuser without X-Scope-ID → full unscoped access (same as ScopedViewSet)
+        if scope is None:
+            return queryset
 
         scope_filter = self.get_inheritable_scope_filter(scope)
         return queryset.filter(scope_filter).distinct()

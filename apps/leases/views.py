@@ -156,15 +156,59 @@ class AgreementStructureViewSet(InheritableScopedViewSet):
             return serializers.AgreementStructureDetailSerializer
         return serializers.AgreementStructureSerializer
 
+    def _get_scope_for_list(self):
+        """Resolve scope for list filtering: X-Scope-ID header or optional scope_id query param."""
+        from apps.accounts.models import ScopeMembership, TenantScope
+
+        scope_id_param = self.request.query_params.get("scope_id")
+        if scope_id_param:
+            try:
+                scope = TenantScope.objects.get(id=scope_id_param, is_active=True)
+            except (TenantScope.DoesNotExist, ValueError):
+                return None
+            user = self.request.user
+            if user.is_superuser:
+                return scope
+            # User must have access to this scope or one of its descendants
+            allowed_scope_ids = [scope.id] + list(
+                scope.get_child_scopes().values_list("id", flat=True)
+            )
+            if ScopeMembership.objects.filter(
+                user=user, scope_id__in=allowed_scope_ids, is_active=True
+            ).exists():
+                return scope
+            return None
+        return self.get_active_scope()
+
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = super(ScopedViewSet, self).get_queryset()
+        scope = self._get_scope_for_list()
+
+        if scope is None and not self.request.user.is_superuser:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied(
+                "Set X-Scope-ID header or a valid scope_id query param you have access to."
+            )
+
+        if scope is None:
+            # Superuser without scope: full access
+            queryset = queryset
+        else:
+            scope_filter = self.get_inheritable_scope_filter(scope)
+            queryset = queryset.filter(scope_filter).distinct()
+
         search = self.request.query_params.get("q")
         if search:
             queryset = queryset.filter(name__icontains=search)
         return queryset.prefetch_related("sections")
 
     def perform_create(self, serializer):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
         scope = self.get_active_scope()
+        if scope is None:
+            raise DRFValidationError({
+                "scope": "X-Scope-ID header is required to create an agreement structure. Set the scope header and try again."
+            })
         instance = serializer.save(scope=scope, created_by=self.request.user)
         if instance.is_default:
             models.AgreementStructure.objects.filter(
