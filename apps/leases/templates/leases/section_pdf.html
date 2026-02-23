@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{{ lease_id }} — {% if single_section %}{{ single_section.name }}{% else %}Section{% endif %}</title>
+<style>
+    @page {
+        size: A4;
+        margin: 2.5cm 2cm 3cm 2cm;
+
+        @frame header {
+            -pdf-frame-content: page-header;
+            top: 0.5cm;
+            left: 2cm;
+            right: 2cm;
+            height: 1.5cm;
+        }
+        @frame footer {
+            -pdf-frame-content: page-footer;
+            bottom: 0.5cm;
+            left: 2cm;
+            right: 2cm;
+            height: 1.8cm;
+        }
+    }
+
+    body {
+        font-family: Times, "Times New Roman", serif;
+        font-size: 11pt;
+        line-height: 1.5;
+        color: #1a1a1a;
+    }
+
+    #page-header {
+        border-bottom: 1px solid #666;
+        padding-bottom: 4px;
+        font-size: 8pt;
+        color: #666;
+    }
+    #page-header .left { float: left; }
+    #page-header .right { float: right; }
+
+    #page-footer {
+        border-top: 1px solid #999;
+        padding-top: 6px;
+        font-size: 8pt;
+        color: #888;
+        text-align: center;
+    }
+    #page-footer .confidential {
+        font-weight: bold;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        font-size: 7pt;
+        color: #999;
+    }
+
+    .draft-watermark {
+        position: fixed;
+        top: 40%;
+        left: 15%;
+        font-size: 100pt;
+        color: #eee;
+        transform: rotate(-30deg);
+        z-index: -1;
+        font-weight: bold;
+        letter-spacing: 20px;
+    }
+
+    .title-block {
+        text-align: center;
+        margin: 0 0 25px 0;
+        padding: 15px 0;
+        border-top: 3px solid #1a1a1a;
+        border-bottom: 3px solid #1a1a1a;
+    }
+    .title-block h1 {
+        font-size: 18pt;
+        font-weight: bold;
+        margin: 0 0 4px 0;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+    }
+    .title-block .subtitle {
+        font-size: 11pt;
+        color: #444;
+        margin: 4px 0;
+    }
+    .title-block .ref {
+        font-size: 9pt;
+        color: #666;
+        margin-top: 6px;
+    }
+
+    .section-heading {
+        font-size: 14pt;
+        font-weight: bold;
+        text-transform: uppercase;
+        border-bottom: 2px solid #333;
+        padding-bottom: 4px;
+        margin: 25px 0 12px 0;
+        letter-spacing: 1px;
+    }
+    .subsection-heading {
+        font-size: 12pt;
+        font-weight: bold;
+        margin: 18px 0 8px 0;
+        color: #222;
+    }
+    .clause-heading {
+        font-size: 11pt;
+        font-weight: bold;
+        font-style: italic;
+        margin: 12px 0 6px 0;
+        color: #333;
+    }
+    .clause-body {
+        margin: 6px 0 15px 20px;
+        text-align: justify;
+        font-size: 10.5pt;
+        line-height: 1.6;
+    }
+    .structure-subsection {
+        margin: 10px 0 10px 20px;
+    }
+    .context-box {
+        border: 1px solid #ccc;
+        padding: 10px 15px;
+        background: #fafafa;
+        margin: 10px 0 20px 0;
+        font-size: 9.5pt;
+    }
+    .context-box .label {
+        font-weight: bold;
+        color: #555;
+        display: inline-block;
+        width: 100px;
+    }
+    .small { font-size: 9pt; color: #666; }
+</style>
+</head>
+<body>
+
+<!-- Page Header -->
+<div id="page-header">
+    <span class="left">{{ landlord.org|default:landlord.name }}</span>
+    <span class="right">{{ lease_id }} v{{ version }} — Section Extract</span>
+</div>
+
+<!-- Page Footer -->
+<div id="page-footer">
+    <div class="confidential">Confidential — Section Extract — For Authorised Use Only</div>
+    <div>Page <pdf:pagenumber> of <pdf:pagecount></div>
+    <div>Generated on {{ generated_date }}</div>
+</div>
+
+{% if is_draft %}
+<div class="draft-watermark">DRAFT</div>
+{% endif %}
+
+<!-- Title -->
+<div class="title-block">
+    <h1>Section Extract</h1>
+    <p class="subtitle">{% if single_section %}{{ single_section.name }}{% endif %}</p>
+    <p class="ref">
+        Agreement: <strong>{{ lease_id }}</strong> v{{ version }} &nbsp;|&nbsp;
+        {{ agreement_type }}
+    </p>
+    {% if structure_name %}
+    <p class="ref">Structure: {{ structure_name }}</p>
+    {% endif %}
+</div>
+
+<!-- Context -->
+<div class="context-box">
+    <div><span class="label">Landlord:</span> {{ landlord_entity_override|default:landlord.name }}</div>
+    <div><span class="label">Tenant:</span> {{ tenant.legal_name }}</div>
+    <div><span class="label">Property:</span> {{ site.name }}{% if site.address %}, {{ site.address }}{% endif %}</div>
+    {% if term_dates %}
+    <div><span class="label">Term:</span> {{ term_dates.commencement_date }} to {{ term_dates.expiry_date }}</div>
+    {% endif %}
+</div>
+
+<!-- Section Content -->
+{% if single_section %}
+<div class="section-heading">{{ single_section.name }}</div>
+
+{% if single_section.description %}
+<p class="clause-body">{{ single_section.description }}</p>
+{% endif %}
+
+{% for clause in single_section.clauses %}
+<div class="clause-heading">{{ clause.clause_id }} — {{ clause.clause_title }}{% if clause.version %} ({{ clause.version }}){% endif %}</div>
+{% if clause.body_text %}
+<div class="clause-body">{{ clause.body_text|linebreaksbr }}</div>
+{% endif %}
+{% endfor %}
+
+{% for child in single_section.children %}
+<div class="structure-subsection">
+    <div class="subsection-heading">{{ child.name }}</div>
+    {% if child.description %}
+    <p class="clause-body">{{ child.description }}</p>
+    {% endif %}
+    {% for clause in child.clauses %}
+    <div class="clause-heading">{{ clause.clause_id }} — {{ clause.clause_title }}{% if clause.version %} ({{ clause.version }}){% endif %}</div>
+    {% if clause.body_text %}
+    <div class="clause-body">{{ clause.body_text|linebreaksbr }}</div>
+    {% endif %}
+    {% endfor %}
+</div>
+{% endfor %}
+
+{% elif sections %}
+{% for section in sections %}
+<div class="section-heading">{{ section.name }}</div>
+{% if section.description %}
+<p class="clause-body">{{ section.description }}</p>
+{% endif %}
+{% for clause in section.clauses %}
+<div class="clause-heading">{{ clause.clause_id }} — {{ clause.clause_title }}{% if clause.version %} ({{ clause.version }}){% endif %}</div>
+{% if clause.body_text %}
+<div class="clause-body">{{ clause.body_text|linebreaksbr }}</div>
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% else %}
+<p class="clause-body"><em>No section data available for this agreement.</em></p>
+{% endif %}
+
+</body>
+</html>

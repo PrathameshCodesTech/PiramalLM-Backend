@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Lease Agreement — {{ lease_id }}</title>
+<style>
+    @page {
+        size: A4;
+        margin: 2.5cm 2cm 3cm 2cm;
+
+        @frame header {
+            -pdf-frame-content: page-header;
+            top: 0.5cm;
+            left: 2cm;
+            right: 2cm;
+            height: 1.5cm;
+        }
+        @frame footer {
+            -pdf-frame-content: page-footer;
+            bottom: 0.5cm;
+            left: 2cm;
+            right: 2cm;
+            height: 1.8cm;
+        }
+    }
+
+    body {
+        font-family: Times, "Times New Roman", serif;
+        font-size: 11pt;
+        line-height: 1.5;
+        color: #1a1a1a;
+    }
+
+    /* Page Header / Footer */
+    #page-header {
+        border-bottom: 1px solid #666;
+        padding-bottom: 4px;
+        font-size: 8pt;
+        color: #666;
+    }
+    #page-header .left { float: left; }
+    #page-header .right { float: right; }
+
+    #page-footer {
+        border-top: 1px solid #999;
+        padding-top: 6px;
+        font-size: 8pt;
+        color: #888;
+        text-align: center;
+    }
+    #page-footer .confidential {
+        font-weight: bold;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        font-size: 7pt;
+        color: #999;
+    }
+
+    /* Watermark for drafts */
+    .draft-watermark {
+        position: fixed;
+        top: 40%;
+        left: 15%;
+        font-size: 100pt;
+        color: #eee;
+        transform: rotate(-30deg);
+        z-index: -1;
+        font-weight: bold;
+        letter-spacing: 20px;
+    }
+
+    /* Title block */
+    .title-block {
+        text-align: center;
+        margin: 0 0 30px 0;
+        padding: 20px 0;
+        border-top: 3px solid #1a1a1a;
+        border-bottom: 3px solid #1a1a1a;
+    }
+    .title-block h1 {
+        font-size: 22pt;
+        font-weight: bold;
+        margin: 0 0 6px 0;
+        letter-spacing: 3px;
+        text-transform: uppercase;
+    }
+    .title-block .subtitle {
+        font-size: 12pt;
+        color: #444;
+        margin: 4px 0;
+    }
+    .title-block .ref {
+        font-size: 10pt;
+        color: #666;
+        margin-top: 8px;
+    }
+
+    /* Org header */
+    .org-header {
+        text-align: center;
+        margin-bottom: 20px;
+    }
+    .org-header .org-name {
+        font-size: 16pt;
+        font-weight: bold;
+        color: #1a1a1a;
+        margin: 0;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+    }
+    .org-header .org-details {
+        font-size: 9pt;
+        color: #555;
+        margin: 4px 0 0 0;
+    }
+
+    /* Section headings */
+    .section-heading {
+        font-size: 14pt;
+        font-weight: bold;
+        text-transform: uppercase;
+        border-bottom: 2px solid #333;
+        padding-bottom: 4px;
+        margin: 30px 0 15px 0;
+        letter-spacing: 1px;
+    }
+    .subsection-heading {
+        font-size: 12pt;
+        font-weight: bold;
+        margin: 20px 0 10px 0;
+        color: #222;
+    }
+    .clause-heading {
+        font-size: 11pt;
+        font-weight: bold;
+        font-style: italic;
+        margin: 12px 0 6px 0;
+        color: #333;
+    }
+
+    /* Parties block */
+    .parties-grid {
+        width: 100%;
+        margin: 15px 0;
+    }
+    .parties-grid td {
+        width: 50%;
+        vertical-align: top;
+        padding: 10px;
+    }
+    .party-box {
+        border: 1px solid #ccc;
+        padding: 12px 15px;
+        background: #fafafa;
+    }
+    .party-box .party-label {
+        font-size: 9pt;
+        font-weight: bold;
+        text-transform: uppercase;
+        color: #888;
+        letter-spacing: 1px;
+        margin-bottom: 6px;
+    }
+    .party-box .party-name {
+        font-size: 13pt;
+        font-weight: bold;
+        color: #1a1a1a;
+        margin-bottom: 4px;
+    }
+    .party-box .party-detail {
+        font-size: 9pt;
+        color: #555;
+        margin: 2px 0;
+    }
+
+    /* Tables */
+    table.data-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 10px 0 20px 0;
+        font-size: 10pt;
+    }
+    table.data-table th {
+        background: #f0f0f0;
+        border: 1px solid #bbb;
+        padding: 6px 10px;
+        text-align: left;
+        font-weight: bold;
+        font-size: 9pt;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: #333;
+    }
+    table.data-table td {
+        border: 1px solid #ccc;
+        padding: 5px 10px;
+        vertical-align: top;
+    }
+    table.data-table tr:nth-child(even) td {
+        background: #fafafa;
+    }
+    table.data-table .total-row td {
+        font-weight: bold;
+        border-top: 2px solid #333;
+        background: #f5f5f5;
+    }
+
+    /* Key-value pairs */
+    table.kv-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 8px 0 16px 0;
+    }
+    table.kv-table td {
+        padding: 4px 0;
+        font-size: 10.5pt;
+        border-bottom: 1px dotted #ddd;
+    }
+    table.kv-table td.kv-label {
+        width: 35%;
+        font-weight: bold;
+        color: #333;
+    }
+    table.kv-table td.kv-value {
+        color: #1a1a1a;
+    }
+
+    /* Clause body */
+    .clause-body {
+        margin: 6px 0 15px 20px;
+        text-align: justify;
+        font-size: 10.5pt;
+        line-height: 1.6;
+    }
+
+    /* Signature block */
+    .signature-block {
+        margin-top: 60px;
+        page-break-inside: avoid;
+    }
+    .sig-grid {
+        width: 100%;
+        margin-top: 40px;
+    }
+    .sig-grid td {
+        width: 45%;
+        vertical-align: top;
+        padding: 0 20px;
+    }
+    .sig-line {
+        border-bottom: 1px solid #333;
+        height: 40px;
+        margin-bottom: 4px;
+    }
+    .sig-label {
+        font-size: 9pt;
+        color: #666;
+    }
+    .sig-name {
+        font-size: 10pt;
+        font-weight: bold;
+        margin-top: 4px;
+    }
+
+    /* Structure sections */
+    .structure-section {
+        margin: 15px 0;
+        page-break-inside: avoid;
+    }
+    .structure-subsection {
+        margin: 10px 0 10px 20px;
+    }
+
+    /* Misc */
+    .recital {
+        text-align: justify;
+        margin: 10px 0;
+        font-size: 10.5pt;
+    }
+    .page-break {
+        page-break-before: always;
+    }
+    .text-center { text-align: center; }
+    .text-right { text-align: right; }
+    .mt-20 { margin-top: 20px; }
+    .mb-10 { margin-bottom: 10px; }
+    .small { font-size: 9pt; color: #666; }
+</style>
+</head>
+<body>
+
+<!-- Page Header (repeats on each page) -->
+<div id="page-header">
+    <span class="left">{{ landlord.org|default:landlord.name }}</span>
+    <span class="right">{{ lease_id }} v{{ version }}</span>
+</div>
+
+<!-- Page Footer (repeats on each page) -->
+<div id="page-footer">
+    <div class="confidential">Confidential — For Authorised Use Only</div>
+    <div>Page <pdf:pagenumber> of <pdf:pagecount></div>
+    <div>Generated on {{ generated_date }}</div>
+</div>
+
+{% if is_draft %}
+<div class="draft-watermark">DRAFT</div>
+{% endif %}
+
+<!-- ================================================================== -->
+<!--  ORGANISATION HEADER                                                -->
+<!-- ================================================================== -->
+<div class="org-header">
+    <p class="org-name">{{ landlord.org|default:landlord.name }}</p>
+    {% if landlord.address %}
+    <p class="org-details">
+        {{ landlord.address }}
+        {% if landlord.city %}, {{ landlord.city }}{% endif %}
+        {% if landlord.state %}, {{ landlord.state }}{% endif %}
+        {% if landlord.country %}, {{ landlord.country }}{% endif %}
+    </p>
+    {% endif %}
+    {% if landlord.registration %}
+    <p class="org-details">Reg. No: {{ landlord.registration }}{% if landlord.tax_id %} &nbsp;|&nbsp; Tax ID: {{ landlord.tax_id }}{% endif %}</p>
+    {% endif %}
+</div>
+
+<!-- ================================================================== -->
+<!--  TITLE BLOCK                                                        -->
+<!-- ================================================================== -->
+<div class="title-block">
+    <h1>Lease Agreement</h1>
+    <p class="subtitle">{{ agreement_type }}</p>
+    <p class="ref">
+        Reference: <strong>{{ lease_id }}</strong> &nbsp;|&nbsp;
+        Version: <strong>v{{ version }}</strong> &nbsp;|&nbsp;
+        Status: <strong>{{ status }}</strong>
+    </p>
+    {% if structure_name %}
+    <p class="ref">Structure: {{ structure_name }}</p>
+    {% endif %}
+</div>
+
+<!-- ================================================================== -->
+<!--  RECITALS                                                           -->
+<!-- ================================================================== -->
+<p class="recital">
+    This Lease Agreement (the &ldquo;<strong>Agreement</strong>&rdquo;) is entered into
+    {% if term_dates and term_dates.commencement_date != '—' %}
+    with effect from <strong>{{ term_dates.commencement_date }}</strong>
+    {% endif %}
+    by and between the parties identified below, upon the terms and conditions set forth herein.
+</p>
+
+<!-- ================================================================== -->
+<!--  PART 1 — PARTIES                                                    -->
+<!-- ================================================================== -->
+<div class="section-heading">Part 1 — The Parties</div>
+
+<table class="parties-grid">
+<tr>
+<td>
+    <div class="party-box">
+        <div class="party-label">Landlord / Lessor</div>
+        <div class="party-name">{{ landlord_entity_override|default:landlord.name }}</div>
+        {% if landlord.entity %}<p class="party-detail">Entity: {{ landlord.entity }}</p>{% endif %}
+        {% if landlord.company %}<p class="party-detail">Company: {{ landlord.company }}</p>{% endif %}
+        {% if landlord.address %}
+        <p class="party-detail">
+            {{ landlord.address }}
+            {% if landlord.city %}, {{ landlord.city }}{% endif %}
+            {% if landlord.state %}, {{ landlord.state }}{% endif %}
+        </p>
+        {% endif %}
+        {% if landlord.registration %}<p class="party-detail">Reg: {{ landlord.registration }}</p>{% endif %}
+        {% if landlord.tax_id %}<p class="party-detail">Tax ID: {{ landlord.tax_id }}</p>{% endif %}
+    </div>
+</td>
+<td>
+    <div class="party-box">
+        <div class="party-label">Tenant / Lessee</div>
+        <div class="party-name">{{ tenant.legal_name }}</div>
+        {% if tenant.trade_name %}<p class="party-detail">Trading as: {{ tenant.trade_name }}</p>{% endif %}
+        {% if tenant.address %}
+        <p class="party-detail">
+            {{ tenant.address }}
+            {% if tenant.city %}, {{ tenant.city }}{% endif %}
+            {% if tenant.state %}, {{ tenant.state }}{% endif %}
+        </p>
+        {% endif %}
+        {% if tenant.registration_number %}<p class="party-detail">Reg: {{ tenant.registration_number }}</p>{% endif %}
+        {% if tenant.tax_id %}<p class="party-detail">Tax ID / GST: {{ tenant.tax_id }}</p>{% endif %}
+        {% if tenant.contact_name and tenant.contact_name != '—' %}
+        <p class="party-detail">Primary Contact: {{ tenant.contact_name }}</p>
+        {% endif %}
+        {% if tenant.contact_email %}<p class="party-detail">Email: {{ tenant.contact_email }}</p>{% endif %}
+    </div>
+</td>
+</tr>
+</table>
+
+<!-- ================================================================== -->
+<!--  PART 2 — PREMISES                                                  -->
+<!-- ================================================================== -->
+<div class="section-heading">Part 2 — Demised Premises</div>
+
+<table class="kv-table">
+<tr><td class="kv-label">Property / Site</td><td class="kv-value">{{ site.name }}{% if site.code %} ({{ site.code }}){% endif %}</td></tr>
+{% if site.address %}<tr><td class="kv-label">Address</td><td class="kv-value">{{ site.address }}{% if site.city %}, {{ site.city }}{% endif %}{% if site.state %}, {{ site.state }}{% endif %}</td></tr>{% endif %}
+<tr><td class="kv-label">Total Allocated Area</td><td class="kv-value">{{ total_area }}</td></tr>
+</table>
+
+{% if allocations %}
+<div class="subsection-heading">Schedule of Allocated Spaces</div>
+<table class="data-table">
+<tr>
+    <th>Level</th>
+    <th>Description</th>
+    <th>Mode</th>
+    <th>Area</th>
+    <th>Monthly Rent</th>
+</tr>
+{% for a in allocations %}
+<tr>
+    <td>{{ a.level }}</td>
+    <td>{{ a.label }}</td>
+    <td>{{ a.mode }}</td>
+    <td>{{ a.area }}</td>
+    <td>{{ a.rent }}</td>
+</tr>
+{% endfor %}
+</table>
+{% endif %}
+
+<!-- ================================================================== -->
+<!--  PART 3 — TERM & DURATION                                           -->
+<!-- ================================================================== -->
+{% if term_dates %}
+<div class="section-heading">Part 3 — Term &amp; Duration</div>
+
+<table class="kv-table">
+<tr><td class="kv-label">Commencement Date</td><td class="kv-value">{{ term_dates.commencement_date }}</td></tr>
+<tr><td class="kv-label">Expiry Date</td><td class="kv-value">{{ term_dates.expiry_date }}</td></tr>
+{% if term_dates.initial_term_months %}<tr><td class="kv-label">Initial Term</td><td class="kv-value">{{ term_dates.initial_term_months }} months</td></tr>{% endif %}
+{% if term_dates.lock_in_months %}
+<tr><td class="kv-label">Lock-in Period</td><td class="kv-value">{{ term_dates.lock_in_months }} months ({{ term_dates.lock_in_start }} to {{ term_dates.lock_in_end }})</td></tr>
+{% endif %}
+<tr><td class="kv-label">Renewal Notice Period</td><td class="kv-value">{{ term_dates.notice_renewal_days }} days</td></tr>
+<tr><td class="kv-label">Landlord Notice Period</td><td class="kv-value">{{ term_dates.notice_landlord_days }} days</td></tr>
+<tr><td class="kv-label">Tenant Notice Period</td><td class="kv-value">{{ term_dates.notice_tenant_days }} days</td></tr>
+</table>
+{% endif %}
+
+{% if rent_free %}
+<div class="subsection-heading">Rent-Free &amp; Fit-Out Period</div>
+<table class="kv-table">
+{% if rent_free.days %}<tr><td class="kv-label">Rent-Free Days</td><td class="kv-value">{{ rent_free.days }} days ({{ rent_free.start_date }} to {{ rent_free.end_date }})</td></tr>{% endif %}
+{% if rent_free.extended_days %}<tr><td class="kv-label">Extended Buffer</td><td class="kv-value">{{ rent_free.extended_days }} days at {{ rent_free.extended_charge_percent }}% charge</td></tr>{% endif %}
+{% if rent_free.fitout_start and rent_free.fitout_start != '—' %}<tr><td class="kv-label">Fit-out Period</td><td class="kv-value">{{ rent_free.fitout_start }} to {{ rent_free.fitout_end }}</td></tr>{% endif %}
+{% if rent_free.cam_during_fitout %}<tr><td class="kv-label">CAM During Fit-out</td><td class="kv-value">Yes</td></tr>{% endif %}
+</table>
+{% endif %}
+
+<!-- ================================================================== -->
+<!--  PART 4 — FINANCIAL TERMS                                           -->
+<!-- ================================================================== -->
+{% if financials %}
+<div class="section-heading">Part 4 — Financial Terms</div>
+
+<div class="subsection-heading">4.1 — Base Rent</div>
+<table class="kv-table">
+<tr><td class="kv-label">Monthly Base Rent</td><td class="kv-value">{{ financials.base_rent_monthly }}</td></tr>
+<tr><td class="kv-label">Rate per Sq Ft (Monthly)</td><td class="kv-value">{{ financials.rate_per_sqft }}</td></tr>
+<tr><td class="kv-label">Annual Rent</td><td class="kv-value">{{ financials.annual_rent }}</td></tr>
+<tr><td class="kv-label">Billing Frequency</td><td class="kv-value">{{ financials.billing_frequency }}</td></tr>
+<tr><td class="kv-label">Payment Due Date</td><td class="kv-value">{{ financials.payment_due_date }}</td></tr>
+{% if financials.first_rent_due and financials.first_rent_due != '—' %}<tr><td class="kv-label">First Rent Due</td><td class="kv-value">{{ financials.first_rent_due }}</td></tr>{% endif %}
+<tr><td class="kv-label">Currency</td><td class="kv-value">{{ financials.currency }}</td></tr>
+</table>
+{% endif %}
+
+{% if escalation %}
+<div class="subsection-heading">4.2 — Rent Escalation</div>
+<table class="kv-table">
+<tr><td class="kv-label">Escalation Type</td><td class="kv-value">{{ escalation.type }}</td></tr>
+{% if escalation.value %}<tr><td class="kv-label">Escalation Rate</td><td class="kv-value">{{ escalation.value }}%</td></tr>{% endif %}
+<tr><td class="kv-label">Frequency</td><td class="kv-value">Every {{ escalation.frequency_months }} months</td></tr>
+<tr><td class="kv-label">First Escalation After</td><td class="kv-value">{{ escalation.first_escalation_months }} months</td></tr>
+{% if escalation.cap %}<tr><td class="kv-label">Cap</td><td class="kv-value">{{ escalation.cap }}%</td></tr>{% endif %}
+{% if escalation.floor %}<tr><td class="kv-label">Floor</td><td class="kv-value">{{ escalation.floor }}%</td></tr>{% endif %}
+{% if escalation.template_name %}<tr><td class="kv-label">Template</td><td class="kv-value">{{ escalation.template_name }}</td></tr>{% endif %}
+</table>
+{% endif %}
+
+{% if cam %}
+<div class="subsection-heading">4.3 — Common Area Maintenance (CAM)</div>
+<table class="kv-table">
+<tr><td class="kv-label">Allocation Basis</td><td class="kv-value">{{ cam.basis }}</td></tr>
+{% if cam.per_sqft and cam.per_sqft != '—' %}<tr><td class="kv-label">Rate per Sq Ft</td><td class="kv-value">{{ cam.per_sqft }}</td></tr>{% endif %}
+{% if cam.fixed and cam.fixed != '—' %}<tr><td class="kv-label">Fixed Amount</td><td class="kv-value">{{ cam.fixed }}</td></tr>{% endif %}
+{% if cam.percentage %}<tr><td class="kv-label">Percentage of Rent</td><td class="kv-value">{{ cam.percentage }}%</td></tr>{% endif %}
+<tr><td class="kv-label">Monthly Total</td><td class="kv-value">{{ cam.monthly_total }}</td></tr>
+</table>
+{% endif %}
+
+{% if deposit %}
+<div class="subsection-heading">4.4 — Security Deposit</div>
+<table class="kv-table">
+<tr><td class="kv-label">Deposit Amount</td><td class="kv-value">{{ deposit.amount }}</td></tr>
+{% if deposit.months_equivalent %}<tr><td class="kv-label">Months Equivalent</td><td class="kv-value">{{ deposit.months_equivalent }} months</td></tr>{% endif %}
+{% if deposit.held_by %}<tr><td class="kv-label">Held By</td><td class="kv-value">{{ deposit.held_by }}</td></tr>{% endif %}
+{% if deposit.interest_bearing %}<tr><td class="kv-label">Interest Bearing</td><td class="kv-value">Yes{% if deposit.interest_rate %} @ {{ deposit.interest_rate }}% p.a.{% endif %}</td></tr>{% endif %}
+{% if deposit.refund_conditions %}<tr><td class="kv-label">Refund Conditions</td><td class="kv-value">{{ deposit.refund_conditions }}</td></tr>{% endif %}
+</table>
+{% endif %}
+
+<!-- ================================================================== -->
+<!--  PART 5 — TERMINATION & EXIT                                        -->
+<!-- ================================================================== -->
+{% if termination %}
+<div class="section-heading">Part 5 — Termination &amp; Early Exit</div>
+
+<div class="subsection-heading">5.1 — Tenant Early Exit</div>
+<table class="kv-table">
+<tr><td class="kv-label">Permitted</td><td class="kv-value">{% if termination.tenant_early_exit %}Yes{% else %}No{% endif %}</td></tr>
+{% if termination.tenant_early_exit %}
+<tr><td class="kv-label">Notice Period</td><td class="kv-value">{{ termination.tenant_notice_days }} days</td></tr>
+{% if termination.tenant_penalty %}<tr><td class="kv-label">Penalty</td><td class="kv-value">{{ termination.tenant_penalty }}</td></tr>{% endif %}
+{% if termination.tenant_conditions %}<tr><td class="kv-label">Conditions</td><td class="kv-value">{{ termination.tenant_conditions }}</td></tr>{% endif %}
+{% endif %}
+</table>
+
+<div class="subsection-heading">5.2 — Landlord Early Termination</div>
+<table class="kv-table">
+<tr><td class="kv-label">Permitted</td><td class="kv-value">{% if termination.landlord_early_termination %}Yes{% else %}No{% endif %}</td></tr>
+{% if termination.landlord_early_termination %}
+<tr><td class="kv-label">Notice Period</td><td class="kv-value">{{ termination.landlord_notice_days }} days</td></tr>
+{% if termination.landlord_compensation %}<tr><td class="kv-label">Compensation</td><td class="kv-value">{{ termination.landlord_compensation }}</td></tr>{% endif %}
+{% if termination.landlord_relocation %}<tr><td class="kv-label">Relocation Assistance</td><td class="kv-value">Yes</td></tr>{% endif %}
+{% endif %}
+</table>
+
+{% if termination.break_clause %}
+<div class="subsection-heading">5.3 — Break Clause</div>
+<table class="kv-table">
+{% if termination.break_date and termination.break_date != '—' %}<tr><td class="kv-label">Break Date</td><td class="kv-value">{{ termination.break_date }}</td></tr>{% endif %}
+{% if termination.break_notice_days %}<tr><td class="kv-label">Notice Required</td><td class="kv-value">{{ termination.break_notice_days }} days</td></tr>{% endif %}
+</table>
+{% endif %}
+
+{% if termination.cause_events %}
+<div class="subsection-heading">5.4 — Termination for Cause</div>
+<p class="clause-body">Cure period: {{ termination.cure_period_days }} days.</p>
+<p class="clause-body">Events allowing termination for cause:</p>
+<ul>
+{% for event in termination.cause_events %}
+    <li>{{ event }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+
+{% if termination.clause_text %}
+<div class="subsection-heading">Termination Clause</div>
+<div class="clause-body">{{ termination.clause_text }}</div>
+{% endif %}
+{% endif %}
+
+<!-- ================================================================== -->
+<!--  PART 6 — RENEWAL OPTIONS                                           -->
+<!-- ================================================================== -->
+{% if renewal %}
+<div class="section-heading">Part 6 — Renewal Options</div>
+<table class="kv-table">
+<tr><td class="kv-label">Pre-Renewal Notice</td><td class="kv-value">{{ renewal.pre_notice_days }} days</td></tr>
+<tr><td class="kv-label">Auto-Renewal</td><td class="kv-value">{% if renewal.auto_renewal %}Yes{% if renewal.auto_term_months %} ({{ renewal.auto_term_months }} months){% endif %}{% else %}No{% endif %}</td></tr>
+<tr><td class="kv-label">Maximum Renewal Cycles</td><td class="kv-value">{{ renewal.max_cycles }}</td></tr>
+</table>
+
+{% if renewal.cycles %}
+<div class="subsection-heading">Renewal Schedule</div>
+<table class="data-table">
+<tr><th>Cycle</th><th>Term (Months)</th><th>Rent Formula</th><th>Escalation %</th></tr>
+{% for cycle in renewal.cycles %}
+<tr>
+    <td>{{ cycle.cycle }}</td>
+    <td>{{ cycle.term_months|default:"—" }}</td>
+    <td>{{ cycle.rent_formula|default:"—" }}</td>
+    <td>{{ cycle.escalation_percent|default:"—" }}</td>
+</tr>
+{% endfor %}
+</table>
+{% endif %}
+
+{% if renewal.notes %}
+<p class="clause-body">{{ renewal.notes }}</p>
+{% endif %}
+{% endif %}
+
+<!-- ================================================================== -->
+<!--  PART 7 — INSURANCE & REINSTATEMENT                                 -->
+<!-- ================================================================== -->
+{% if insurance %}
+<div class="section-heading">Part 7 — Insurance &amp; Reinstatement</div>
+
+<div class="subsection-heading">7.1 — Reinstatement</div>
+<table class="kv-table">
+<tr><td class="kv-label">Restore Condition</td><td class="kv-value">{{ insurance.restore_condition }}</td></tr>
+{% if insurance.restore_details %}<tr><td class="kv-label">Details</td><td class="kv-value">{{ insurance.restore_details }}</td></tr>{% endif %}
+{% if insurance.reinstatement_deposit and insurance.reinstatement_deposit != '—' %}<tr><td class="kv-label">Deposit</td><td class="kv-value">{{ insurance.reinstatement_deposit }}</td></tr>{% endif %}
+{% if insurance.reinstatement_days %}<tr><td class="kv-label">Timeline</td><td class="kv-value">{{ insurance.reinstatement_days }} days</td></tr>{% endif %}
+</table>
+
+<div class="subsection-heading">7.2 — Insurance Requirements</div>
+<table class="kv-table">
+<tr><td class="kv-label">Public Liability</td><td class="kv-value">{% if insurance.public_liability %}Required — {{ insurance.public_liability_coverage }}{% else %}Not Required{% endif %}</td></tr>
+<tr><td class="kv-label">Property Insurance</td><td class="kv-value">{% if insurance.property_insurance %}Required — {{ insurance.property_coverage }}{% else %}Not Required{% endif %}</td></tr>
+<tr><td class="kv-label">Business Interruption</td><td class="kv-value">{% if insurance.business_interruption %}Required{% else %}Not Required{% endif %}</td></tr>
+<tr><td class="kv-label">Landlord as Additional Insured</td><td class="kv-value">{% if insurance.landlord_additional_insured %}Yes{% else %}No{% endif %}</td></tr>
+</table>
+
+{% if insurance.indemnity_notes %}
+<div class="subsection-heading">Indemnity</div>
+<div class="clause-body">{{ insurance.indemnity_notes }}</div>
+{% endif %}
+{% endif %}
+
+<!-- ================================================================== -->
+<!--  PART 8 — SUBLET & SIGNAGE / EXCLUSIVITY                           -->
+<!-- ================================================================== -->
+{% if sublet_signage %}
+<div class="section-heading">Part 8 — Sub-letting &amp; Signage Rights</div>
+<table class="kv-table">
+<tr><td class="kv-label">Sub-letting</td><td class="kv-value">{{ sublet_signage.sublet_permission }}</td></tr>
+{% if sublet_signage.max_sublet_pct %}<tr><td class="kv-label">Max Sub-let Area</td><td class="kv-value">{{ sublet_signage.max_sublet_pct }}%</td></tr>{% endif %}
+{% if sublet_signage.sublet_restrictions %}<tr><td class="kv-label">Restrictions</td><td class="kv-value">{{ sublet_signage.sublet_restrictions }}</td></tr>{% endif %}
+<tr><td class="kv-label">Signage</td><td class="kv-value">{% if sublet_signage.signage_permitted %}Permitted{% else %}Not Permitted{% endif %}</td></tr>
+{% if sublet_signage.signage_locations %}<tr><td class="kv-label">Signage Locations</td><td class="kv-value">{{ sublet_signage.signage_locations }}</td></tr>{% endif %}
+{% if sublet_signage.signage_specs %}<tr><td class="kv-label">Specifications</td><td class="kv-value">{{ sublet_signage.signage_specs }}</td></tr>{% endif %}
+</table>
+{% endif %}
+
+{% if exclusivity %}
+<div class="section-heading">Part 9 — Exclusivity &amp; Non-Compete</div>
+<table class="kv-table">
+<tr><td class="kv-label">Exclusive Use</td><td class="kv-value">{% if exclusivity.exclusive_use %}Granted{% else %}Not Granted{% endif %}</td></tr>
+{% if exclusivity.category %}<tr><td class="kv-label">Category</td><td class="kv-value">{{ exclusivity.category }}</td></tr>{% endif %}
+{% if exclusivity.radius %}<tr><td class="kv-label">Radius</td><td class="kv-value">{{ exclusivity.radius }}</td></tr>{% endif %}
+{% if exclusivity.exceptions %}<tr><td class="kv-label">Exceptions</td><td class="kv-value">{{ exclusivity.exceptions }}</td></tr>{% endif %}
+<tr><td class="kv-label">Non-Compete</td><td class="kv-value">{% if exclusivity.non_compete %}Active{% if exclusivity.non_compete_months %} ({{ exclusivity.non_compete_months }} months){% endif %}{% if exclusivity.non_compete_km %}, {{ exclusivity.non_compete_km }} km radius{% endif %}{% else %}Not Active{% endif %}</td></tr>
+</table>
+{% endif %}
+
+<!-- ================================================================== -->
+<!--  PART 10 — DISPUTE RESOLUTION                                       -->
+<!-- ================================================================== -->
+{% if dispute %}
+<div class="section-heading">Part 10 — Dispute Resolution &amp; Governing Law</div>
+<table class="kv-table">
+<tr><td class="kv-label">Mechanism</td><td class="kv-value">{{ dispute.mechanism }}</td></tr>
+{% if dispute.arbitration_seat %}<tr><td class="kv-label">Arbitration Seat</td><td class="kv-value">{{ dispute.arbitration_seat }}</td></tr>{% endif %}
+{% if dispute.arbitration_rules %}<tr><td class="kv-label">Arbitration Rules</td><td class="kv-value">{{ dispute.arbitration_rules }}</td></tr>{% endif %}
+{% if dispute.arbitration_language %}<tr><td class="kv-label">Language</td><td class="kv-value">{{ dispute.arbitration_language }}</td></tr>{% endif %}
+{% if dispute.num_arbitrators %}<tr><td class="kv-label">Arbitrators</td><td class="kv-value">{{ dispute.num_arbitrators }}</td></tr>{% endif %}
+{% if dispute.mediation_first %}<tr><td class="kv-label">Mediation First</td><td class="kv-value">Yes{% if dispute.mediation_days %} ({{ dispute.mediation_days }} days){% endif %}</td></tr>{% endif %}
+<tr><td class="kv-label">Governing Law</td><td class="kv-value">{{ dispute.governing_law_country }}{% if dispute.governing_law_state %}, {{ dispute.governing_law_state }}{% endif %}</td></tr>
+{% if dispute.jurisdiction %}<tr><td class="kv-label">Jurisdiction</td><td class="kv-value">{{ dispute.jurisdiction }}{% if dispute.exclusive_jurisdiction %} (Exclusive){% endif %}</td></tr>{% endif %}
+</table>
+{% if dispute.summary %}
+<div class="clause-body">{{ dispute.summary }}</div>
+{% endif %}
+{% endif %}
+
+<!-- ================================================================== -->
+<!--  AGREEMENT STRUCTURE SECTIONS (with clauses)                        -->
+<!-- ================================================================== -->
+{% if sections %}
+<div class="page-break"></div>
+<div class="section-heading">Annexure — Agreement Clauses</div>
+
+{% if structure_name %}
+<p class="small">Document structure: <strong>{{ structure_name }}</strong></p>
+{% endif %}
+
+{% for section in sections %}
+<div class="structure-section">
+    <div class="subsection-heading">{{ forloop.counter }}. {{ section.name }}</div>
+    {% if section.description %}
+    <p class="clause-body">{{ section.description }}</p>
+    {% endif %}
+
+    {% for clause in section.clauses %}
+    <div class="clause-heading">{{ clause.clause_id }} — {{ clause.clause_title }}{% if clause.version %} ({{ clause.version }}){% endif %}</div>
+    {% if clause.body_text %}
+    <div class="clause-body">{{ clause.body_text|linebreaksbr }}</div>
+    {% endif %}
+    {% endfor %}
+
+    {% for child in section.children %}
+    <div class="structure-subsection">
+        <div class="clause-heading">{{ forloop.parentloop.counter }}.{{ forloop.counter }} {{ child.name }}</div>
+        {% if child.description %}
+        <p class="clause-body">{{ child.description }}</p>
+        {% endif %}
+        {% for clause in child.clauses %}
+        <div class="clause-heading">{{ clause.clause_id }} — {{ clause.clause_title }}{% if clause.version %} ({{ clause.version }}){% endif %}</div>
+        {% if clause.body_text %}
+        <div class="clause-body">{{ clause.body_text|linebreaksbr }}</div>
+        {% endif %}
+        {% endfor %}
+    </div>
+    {% endfor %}
+</div>
+{% endfor %}
+{% endif %}
+
+<!-- ================================================================== -->
+<!--  SIGNATURE BLOCK                                                    -->
+<!-- ================================================================== -->
+<div class="signature-block">
+    <div class="section-heading">Execution</div>
+
+    <p class="recital">
+        IN WITNESS WHEREOF, the parties hereto have executed this Lease Agreement
+        as of the date first written above.
+    </p>
+
+    <table class="sig-grid">
+    <tr>
+    <td>
+        <p style="font-weight:bold; font-size:10pt; margin-bottom:30px;">FOR AND ON BEHALF OF THE LANDLORD</p>
+        <div class="sig-line"></div>
+        <p class="sig-label">Authorised Signatory</p>
+        <p class="sig-name">{{ landlord_entity_override|default:landlord.name }}</p>
+        <br>
+        <div class="sig-line"></div>
+        <p class="sig-label">Name &amp; Designation</p>
+        <br>
+        <div class="sig-line"></div>
+        <p class="sig-label">Date</p>
+    </td>
+    <td>
+        <p style="font-weight:bold; font-size:10pt; margin-bottom:30px;">FOR AND ON BEHALF OF THE TENANT</p>
+        <div class="sig-line"></div>
+        <p class="sig-label">Authorised Signatory</p>
+        <p class="sig-name">{{ tenant.legal_name }}</p>
+        <br>
+        <div class="sig-line"></div>
+        <p class="sig-label">Name &amp; Designation</p>
+        <br>
+        <div class="sig-line"></div>
+        <p class="sig-label">Date</p>
+    </td>
+    </tr>
+    </table>
+
+    <div class="mt-20">
+        <p style="font-weight:bold; font-size:10pt;">WITNESSES:</p>
+        <table class="sig-grid">
+        <tr>
+        <td>
+            <div class="sig-line" style="margin-top:30px;"></div>
+            <p class="sig-label">Witness 1: Name, Address &amp; Signature</p>
+        </td>
+        <td>
+            <div class="sig-line" style="margin-top:30px;"></div>
+            <p class="sig-label">Witness 2: Name, Address &amp; Signature</p>
+        </td>
+        </tr>
+        </table>
+    </div>
+</div>
+
+</body>
+</html>

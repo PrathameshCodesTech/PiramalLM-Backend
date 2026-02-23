@@ -844,6 +844,9 @@ class AgreementDetailSerializer(serializers.ModelSerializer):
     primary_contact_details = TenantContactSerializer(source="primary_contact", read_only=True)
     site_details = serializers.SerializerMethodField()
 
+    # Agreement Structure with nested sections
+    structure = AgreementStructureDetailSerializer(read_only=True)
+
     # Nested terms (OneToOne relations)
     term_dates = LeaseTermDatesSerializer(read_only=True)
     rent_free = LeaseRentFreeSerializer(read_only=True)

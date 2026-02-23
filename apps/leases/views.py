@@ -3,6 +3,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.db.models import Q, Sum
+from django.http import HttpResponse
 from django.utils import timezone
 
 from apps.core.viewsets import ScopedViewSet, InheritableScopedViewSet
@@ -492,6 +493,44 @@ class AgreementViewSet(ScopedViewSet):
                 },
             }
         )
+
+    @action(detail=True, methods=["get"], url_path="generate-pdf")
+    def generate_pdf(self, request, pk=None):
+        """Generate a PDF of the agreement.
+
+        Query params:
+            section - Optional section ID for section-only PDF
+        """
+        from .pdf_generator import render_agreement_pdf
+
+        agreement = self.get_object()
+        section_id = request.query_params.get("section")
+
+        buf = render_agreement_pdf(agreement, section_id=section_id)
+
+        if section_id:
+            filename = f"{agreement.lease_id}_section_{section_id}.pdf"
+        else:
+            filename = f"{agreement.lease_id}_v{agreement.version_number}.pdf"
+
+        response = HttpResponse(buf.read(), content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+    @action(detail=True, methods=["get"], url_path="preview-html")
+    def preview_html(self, request, pk=None):
+        """Return rendered HTML preview of the agreement.
+
+        Query params:
+            section - Optional section ID for section-only preview
+        """
+        from .pdf_generator import render_agreement_html
+
+        agreement = self.get_object()
+        section_id = request.query_params.get("section")
+
+        html = render_agreement_html(agreement, section_id=section_id)
+        return HttpResponse(html, content_type="text/html; charset=utf-8")
 
     @action(detail=True, methods=["post"])
     def submit(self, request, pk=None):
