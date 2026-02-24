@@ -23,6 +23,7 @@ router.register(r"billing-rules", views.BillingRuleViewSet, basename="billing-ru
 router.register(r"dispute-rules", views.DisputeRuleViewSet, basename="dispute-rule")
 router.register(r"credit-rules", views.CreditRuleViewSet, basename="credit-rule")
 router.register(r"ar-global-settings", views.ARGlobalSettingsViewSet, basename="ar-global-settings")
+router.register(r"pending-actions", views.PendingActionViewSet, basename="pending-action")
 
 urlpatterns = router.urls + [
     # Bundle endpoints for fetching all config at once

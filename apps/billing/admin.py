@@ -173,11 +173,11 @@ class SiteBillingConfigAdmin(admin.ModelAdmin):
 @admin.register(models.BillingRule)
 class BillingRuleAdmin(admin.ModelAdmin):
     list_display = (
-        "rule_id", "name", "category", "applies_to",
-        "status", "owner", "created_at"
+        "rule_id", "name", "charge_type", "calculation_method",
+        "trigger_event", "category", "applies_to", "status", "owner", "created_at"
     )
-    list_filter = ("category", "applies_to", "status")
-    search_fields = ("rule_id", "name", "description")
+    list_filter = ("charge_type", "calculation_method", "trigger_event", "category", "applies_to", "status")
+    search_fields = ("rule_id", "name", "description", "gl_code")
     ordering = ("-created_at",)
     readonly_fields = ("rule_id", "created_at", "updated_at", "created_by", "updated_by")
     fieldsets = (
@@ -185,10 +185,16 @@ class BillingRuleAdmin(admin.ModelAdmin):
             "fields": ("rule_id", "name", "description")
         }),
         ("Classification", {
-            "fields": ("category", "applies_to", "status")
+            "fields": ("category", "applies_to", "charge_type", "status")
         }),
-        ("Configuration", {
-            "fields": ("rule_config",)
+        ("Calculation", {
+            "fields": ("calculation_method", "amount", "rate", "max_cap_amount")
+        }),
+        ("Trigger", {
+            "fields": ("trigger_event", "grace_period_days", "trigger_mode")
+        }),
+        ("GL Mapping", {
+            "fields": ("gl_code",)
         }),
         ("Ownership", {
             "fields": ("owner",)
@@ -240,9 +246,9 @@ class DisputeRuleAdmin(admin.ModelAdmin):
 class CreditRuleAdmin(admin.ModelAdmin):
     list_display = (
         "name", "trigger_type", "variance_threshold", "variance_basis",
-        "approval_level", "auto_approve", "status"
+        "approval_role", "auto_approve", "status"
     )
-    list_filter = ("trigger_type", "variance_basis", "approval_level", "auto_approve", "status")
+    list_filter = ("trigger_type", "variance_basis", "auto_approve", "status")
     search_fields = ("name", "description")
     ordering = ("name",)
     fieldsets = (
@@ -257,7 +263,7 @@ class CreditRuleAdmin(admin.ModelAdmin):
         }),
         ("Approval & Posting", {
             "fields": (
-                "approval_level", "auto_approve",
+                "approval_role", "auto_approve",
                 "auto_post_to_gl", "requires_documentation"
             )
         }),

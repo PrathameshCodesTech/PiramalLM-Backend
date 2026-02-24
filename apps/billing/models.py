@@ -423,6 +423,7 @@ class SiteBillingConfig(TenantModel):
 class BillingRule(TenantModel):
     """
     Master billing rules that can be applied at Lease or Property level.
+    Defines what charge to raise, how to calculate it, and when to trigger it.
 
     UI: Billing & Invoice Rules tab - Rules list
     """
@@ -442,13 +443,37 @@ class BillingRule(TenantModel):
         DRAFT = "DRAFT", "Draft"
         INACTIVE = "INACTIVE", "Inactive"
 
+    class TriggerMode(models.TextChoices):
+        MANUAL = "MANUAL", "Manual (alert, I'll apply)"
+        AUTO = "AUTO", "Auto (fire immediately)"
+
+    class ChargeType(models.TextChoices):
+        LATE_PAYMENT_FEE = "LATE_PAYMENT_FEE", "Late Payment Fee"
+        INTEREST = "INTEREST", "Interest"
+        PENALTY = "PENALTY", "Penalty"
+        ADMINISTRATIVE_FEE = "ADMINISTRATIVE_FEE", "Administrative Fee"
+        CAM_RECONCILIATION = "CAM_RECONCILIATION", "CAM Reconciliation"
+        OTHER = "OTHER", "Other"
+
+    class CalculationMethod(models.TextChoices):
+        FLAT = "FLAT", "Flat Amount"
+        PERCENTAGE_OF_OUTSTANDING = "PERCENTAGE_OF_OUTSTANDING", "% of Outstanding"
+        PERCENTAGE_OF_RENT = "PERCENTAGE_OF_RENT", "% of Rent"
+        PER_DAY = "PER_DAY", "Per Day (flat × overdue days)"
+
+    class TriggerEvent(models.TextChoices):
+        OVERDUE = "OVERDUE", "When Invoice is Overdue"
+        MONTHLY = "MONTHLY", "Monthly (recurring)"
+        ON_INVOICE = "ON_INVOICE", "On Invoice Generation"
+        MANUAL_ONLY = "MANUAL_ONLY", "Manual Trigger Only"
+
     rule_id = models.CharField(
         max_length=20,
         help_text="Auto-generated rule ID e.g., BR-001"
     )
     name = models.CharField(
         max_length=100,
-        help_text="Rule name e.g., 'Late Payment Fee'"
+        help_text="Rule name e.g., 'Late Payment Fee 2%'"
     )
     description = models.TextField(
         blank=True,
@@ -470,12 +495,67 @@ class BillingRule(TenantModel):
         choices=RuleStatus.choices,
         default=RuleStatus.DRAFT
     )
+    trigger_mode = models.CharField(
+        max_length=10,
+        choices=TriggerMode.choices,
+        default=TriggerMode.MANUAL,
+        help_text="MANUAL = create a pending action alert; AUTO = fire immediately"
+    )
 
-    # Rule configuration (flexible JSON)
-    rule_config = models.JSONField(
-        default=dict,
+    # What charge to raise
+    charge_type = models.CharField(
+        max_length=30,
+        choices=ChargeType.choices,
+        default=ChargeType.LATE_PAYMENT_FEE,
+        help_text="Type of charge this rule raises"
+    )
+
+    # How to calculate the charge
+    calculation_method = models.CharField(
+        max_length=40,
+        choices=CalculationMethod.choices,
+        default=CalculationMethod.FLAT,
+        help_text="How the charge amount is calculated"
+    )
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
         blank=True,
-        help_text="Rule-specific configuration"
+        help_text="Flat amount (used when method is FLAT or PER_DAY)"
+    )
+    rate = models.DecimalField(
+        max_digits=7,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text="Rate as a percentage e.g., 2.00 = 2% (used when method is PERCENTAGE_*)"
+    )
+    max_cap_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Maximum charge amount (ceiling). Leave blank for no cap."
+    )
+
+    # When to trigger
+    trigger_event = models.CharField(
+        max_length=20,
+        choices=TriggerEvent.choices,
+        default=TriggerEvent.OVERDUE,
+        help_text="Event that triggers this rule"
+    )
+    grace_period_days = models.PositiveIntegerField(
+        default=0,
+        help_text="Days after trigger event before rule fires (e.g., 7 = charge after 7 overdue days)"
+    )
+
+    # GL mapping
+    gl_code = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="GL account code for this charge e.g., 4100-LATE-FEE"
     )
 
     # Ownership
@@ -546,6 +626,10 @@ class DisputeRule(TenantModel):
     class RuleStatus(models.TextChoices):
         ACTIVE = "ACTIVE", "Active"
         INACTIVE = "INACTIVE", "Inactive"
+
+    class TriggerMode(models.TextChoices):
+        MANUAL = "MANUAL", "Manual (alert, I'll apply)"
+        AUTO = "AUTO", "Auto (fire immediately)"
 
     name = models.CharField(
         max_length=100,
@@ -631,6 +715,12 @@ class DisputeRule(TenantModel):
         choices=RuleStatus.choices,
         default=RuleStatus.ACTIVE
     )
+    trigger_mode = models.CharField(
+        max_length=10,
+        choices=TriggerMode.choices,
+        default=TriggerMode.MANUAL,
+        help_text="MANUAL = create a pending action alert; AUTO = fire immediately"
+    )
 
     class Meta:
         verbose_name = "Dispute Rule"
@@ -671,17 +761,13 @@ class CreditRule(TenantModel):
         PERCENTAGE = "PERCENTAGE", "Percentage"
         FIXED_AMOUNT = "FIXED_AMOUNT", "Fixed Amount"
 
-    class ApprovalLevel(models.TextChoices):
-        AR_EXECUTIVE = "AR_EXECUTIVE", "AR Executive"
-        AR_SUPERVISOR = "AR_SUPERVISOR", "AR Supervisor"
-        AR_MANAGER = "AR_MANAGER", "AR Manager"
-        FINANCE_HEAD = "FINANCE_HEAD", "Finance Head"
-        OPERATIONS_MANAGER = "OPERATIONS_MANAGER", "Operations Manager"
-        CFO = "CFO", "CFO"
-
     class RuleStatus(models.TextChoices):
         ACTIVE = "ACTIVE", "Active"
         INACTIVE = "INACTIVE", "Inactive"
+
+    class TriggerMode(models.TextChoices):
+        MANUAL = "MANUAL", "Manual (alert, I'll apply)"
+        AUTO = "AUTO", "Auto (fire immediately)"
 
     name = models.CharField(
         max_length=100,
@@ -720,11 +806,13 @@ class CreditRule(TenantModel):
     )
 
     # Approval & Posting
-    approval_level = models.CharField(
-        max_length=30,
-        choices=ApprovalLevel.choices,
-        default=ApprovalLevel.AR_SUPERVISOR,
-        help_text="Who needs to approve credit notes from this rule"
+    approval_role = models.ForeignKey(
+        "accounts.Role",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="credit_rules_requiring_approval",
+        help_text="Role that must approve credit notes triggered by this rule",
     )
     auto_approve = models.BooleanField(
         default=False,
@@ -745,6 +833,12 @@ class CreditRule(TenantModel):
         choices=RuleStatus.choices,
         default=RuleStatus.ACTIVE
     )
+    trigger_mode = models.CharField(
+        max_length=10,
+        choices=TriggerMode.choices,
+        default=TriggerMode.MANUAL,
+        help_text="MANUAL = create a pending action alert; AUTO = fire immediately"
+    )
 
     class Meta:
         verbose_name = "Credit Rule"
@@ -758,7 +852,8 @@ class CreditRule(TenantModel):
         ]
 
     def __str__(self):
-        return f"{self.name} - {self.get_approval_level_display()}"
+        role = self.approval_role.name if self.approval_role_id else "No role"
+        return f"{self.name} - {role}"
 
 
 # =============================================================================
@@ -921,6 +1016,71 @@ class ARRule(TenantModel):
 
     def __str__(self):
         return f"AR Rules - {self.agreement.lease_id}"
+
+
+# =============================================================================
+# PENDING ACTIONS (Rules Engine output)
+# =============================================================================
+
+class PendingAction(TenantModel):
+    """
+    Created when a rule condition is met in MANUAL trigger_mode.
+    User reviews and clicks Apply or Dismiss.
+    In AUTO mode rules fire immediately and a log entry is created (status=APPLIED).
+    """
+
+    class RuleType(models.TextChoices):
+        BILLING = "BILLING", "Billing Rule"
+        CREDIT = "CREDIT", "Credit Rule"
+        DISPUTE = "DISPUTE", "Dispute Rule"
+
+    class ObjectType(models.TextChoices):
+        INVOICE = "INVOICE", "Invoice"
+        CREDIT_NOTE = "CREDIT_NOTE", "Credit Note"
+        DISPUTE = "DISPUTE", "Invoice Dispute"
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        APPLIED = "APPLIED", "Applied"
+        DISMISSED = "DISMISSED", "Dismissed"
+
+    rule_type = models.CharField(max_length=10, choices=RuleType.choices)
+    billing_rule = models.ForeignKey(
+        BillingRule, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="pending_actions"
+    )
+    credit_rule = models.ForeignKey(
+        CreditRule, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="pending_actions"
+    )
+    dispute_rule = models.ForeignKey(
+        DisputeRule, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="pending_actions"
+    )
+
+    object_type = models.CharField(max_length=20, choices=ObjectType.choices)
+    object_id = models.PositiveIntegerField(help_text="PK of the invoice/credit note/dispute")
+
+    action_description = models.TextField(help_text="Human-readable description of what will happen when applied")
+    status = models.CharField(max_length=15, choices=Status.choices, default=Status.PENDING)
+
+    triggered_at = models.DateTimeField(auto_now_add=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+    applied_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="applied_pending_actions"
+    )
+    note = models.TextField(blank=True, help_text="Optional note when applying or dismissing")
+
+    class Meta:
+        verbose_name = "Pending Action"
+        verbose_name_plural = "Pending Actions"
+        ordering = ["-triggered_at"]
+
+    def __str__(self):
+        return f"[{self.rule_type}] {self.action_description[:60]} — {self.status}"
 
 
 class Invoice(TenantModel):

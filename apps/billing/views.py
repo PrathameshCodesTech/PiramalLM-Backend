@@ -525,6 +525,71 @@ class ARGlobalSettingsViewSet(ScopedViewSet):
 
 
 # =============================================================================
+# PENDING ACTIONS VIEWSET
+# =============================================================================
+
+class PendingActionViewSet(ScopedViewSet):
+    """
+    ViewSet for pending actions created by the rules engine.
+
+    Endpoints:
+    - GET  /pending-actions/          - List all pending actions for scope
+    - GET  /pending-actions/?status=PENDING - Filter by status
+    - POST /pending-actions/{id}/apply/   - Apply the action
+    - POST /pending-actions/{id}/dismiss/ - Dismiss the action
+    """
+
+    queryset = models.PendingAction.objects.all()
+    serializer_class = serializers.PendingActionSerializer
+
+    def get_queryset(self):
+        scope = self.get_active_scope()
+        qs = models.PendingAction.objects.filter(scope=scope)
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+    @action(detail=True, methods=["post"])
+    def apply(self, request, pk=None):
+        """Mark a pending action as applied."""
+        action_obj = self.get_object()
+        if action_obj.status != models.PendingAction.Status.PENDING:
+            return Response(
+                {"error": f"Action is already {action_obj.status.lower()}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        action_obj.status = models.PendingAction.Status.APPLIED
+        action_obj.applied_at = timezone.now()
+        action_obj.applied_by = request.user
+        action_obj.note = request.data.get("note", "")
+        action_obj.save()
+        return Response(serializers.PendingActionSerializer(action_obj).data)
+
+    @action(detail=True, methods=["post"])
+    def dismiss(self, request, pk=None):
+        """Dismiss a pending action without applying it."""
+        action_obj = self.get_object()
+        if action_obj.status != models.PendingAction.Status.PENDING:
+            return Response(
+                {"error": f"Action is already {action_obj.status.lower()}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        action_obj.status = models.PendingAction.Status.DISMISSED
+        action_obj.applied_by = request.user
+        action_obj.note = request.data.get("note", "")
+        action_obj.save()
+        return Response(serializers.PendingActionSerializer(action_obj).data)
+
+    @action(detail=False, methods=["get"], url_path="count")
+    def count(self, request):
+        """Return count of PENDING actions (for badge in header)."""
+        scope = self.get_active_scope()
+        n = models.PendingAction.objects.filter(scope=scope, status=models.PendingAction.Status.PENDING).count()
+        return Response({"pending_count": n})
+
+
+# =============================================================================
 # BILLING CONFIGURATION BUNDLE VIEW
 # =============================================================================
 
@@ -862,6 +927,7 @@ class InvoiceViewSet(ScopedViewSet):
     @action(detail=True, methods=["post"])
     def dispute(self, request, pk=None):
         """Mark invoice as disputed."""
+        from .engines import RulesEngine
         invoice = self.get_object()
         invoice.is_disputed = True
         invoice.dispute_reason = request.data.get("reason", "")
@@ -869,6 +935,11 @@ class InvoiceViewSet(ScopedViewSet):
         invoice.disputed_by = request.user
         invoice.status = models.Invoice.InvoiceStatus.DISPUTED
         invoice.save()
+        scope = self.get_active_scope()
+        try:
+            RulesEngine.check_dispute_rules(invoice, scope, request.user)
+        except Exception:
+            pass  # Never block dispute if engine fails
         serializer = self.get_serializer(invoice)
         return Response(serializer.data)
 
@@ -1185,8 +1256,13 @@ class CreditNoteViewSet(ScopedViewSet):
         return queryset.select_related("invoice", "invoice__agreement", "approved_by")
 
     def perform_create(self, serializer):
+        from .engines import RulesEngine
         scope = self.get_active_scope()
-        serializer.save(scope=scope, created_by=self.request.user)
+        credit_note = serializer.save(scope=scope, created_by=self.request.user)
+        try:
+            RulesEngine.check_credit_rules(credit_note, scope, self.request.user)
+        except Exception:
+            pass  # Never block CN creation if engine fails
 
     def perform_update(self, serializer):
         serializer.save(updated_by=self.request.user)
@@ -2087,7 +2163,27 @@ class LeaseRulesViewSet(ScopedViewSet):
                     }
                 )
 
-            # Return updated data
-            return self.rules(request._request, pk=pk)
+            # Return updated data (re-fetch to reflect saved state)
+            from apps.leases.serializers import LeaseBillingSerializer, LeaseEscalationSerializer
+            agreement.refresh_from_db()
+            billing_data = None
+            if hasattr(agreement, "billing"):
+                billing_data = LeaseBillingSerializer(agreement.billing).data
+            escalation_data = None
+            if hasattr(agreement, "escalation"):
+                escalation_data = LeaseEscalationSerializer(agreement.escalation).data
+            ar_rules_data = None
+            try:
+                ar_rules_data = serializers.ARRuleSerializer(agreement.ar_rules).data
+            except models.ARRule.DoesNotExist:
+                pass
+            ageing_buckets = models.AgeingBucket.objects.filter(scope=scope)
+            ageing_data = serializers.AgeingBucketListSerializer(ageing_buckets, many=True).data
+            return Response({
+                "billing": billing_data,
+                "escalation": escalation_data,
+                "ar_rules": ar_rules_data,
+                "ageing_buckets": ageing_data,
+            })
 
         return Response({"error": "Method not allowed"}, status=status.HTTP_405_METHOD_NOT_ALLOWED)

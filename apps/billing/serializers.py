@@ -671,6 +671,7 @@ class BillingRuleListSerializer(serializers.ModelSerializer):
         model = models.BillingRule
         fields = (
             "id", "rule_id", "name", "category", "applies_to",
+            "charge_type", "calculation_method", "trigger_event",
             "status", "owner_name", "created_at"
         )
 
@@ -785,41 +786,48 @@ class DisputeRuleDetailSerializer(serializers.ModelSerializer):
 
 class CreditRuleListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for list views."""
+    approval_role_name = serializers.CharField(source="approval_role.name", read_only=True, default=None)
+
     class Meta:
         model = models.CreditRule
         fields = (
             "id", "name", "trigger_type", "variance_threshold",
-            "variance_basis", "approval_level", "auto_approve", "status"
+            "variance_basis", "approval_role", "approval_role_name", "auto_approve", "status"
         )
 
 
 class CreditRuleSerializer(serializers.ModelSerializer):
     """Full serializer for credit rules."""
+    approval_role_name = serializers.CharField(source="approval_role.name", read_only=True, default=None)
+
     class Meta:
         model = models.CreditRule
         fields = "__all__"
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
-            "created_by", "updated_by", "is_active", "deleted_at"
+            "created_by", "updated_by", "is_active", "deleted_at",
+            "approval_role_name",
         )
 
 
 class CreditRuleDetailSerializer(serializers.ModelSerializer):
     """Detail serializer with trigger display."""
     trigger_display = serializers.SerializerMethodField()
+    approval_role_name = serializers.CharField(source="approval_role.name", read_only=True, default=None)
 
     class Meta:
         model = models.CreditRule
         fields = "__all__"
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
-            "created_by", "updated_by", "is_active", "deleted_at"
+            "created_by", "updated_by", "is_active", "deleted_at",
+            "approval_role_name",
         )
 
     def get_trigger_display(self, obj):
         """Human-readable trigger condition."""
         if obj.variance_threshold:
-            unit = "%" if obj.variance_basis == "PERCENTAGE" else obj.threshold_currency if hasattr(obj, 'threshold_currency') else "INR"
+            unit = "%" if obj.variance_basis == "PERCENTAGE" else "INR"
             return f"{obj.get_trigger_type_display()}: {obj.variance_threshold}{unit}"
         return obj.get_trigger_type_display()
 
@@ -848,6 +856,43 @@ class ARGlobalSettingsUpdateSerializer(serializers.ModelSerializer):
             "id", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+
+
+# =============================================================================
+# PENDING ACTION SERIALIZERS
+# =============================================================================
+
+class PendingActionSerializer(serializers.ModelSerializer):
+    """Serializer for pending actions created by the rules engine."""
+    rule_name = serializers.SerializerMethodField()
+    applied_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.PendingAction
+        fields = (
+            "id", "scope", "rule_type", "billing_rule", "credit_rule", "dispute_rule",
+            "object_type", "object_id", "action_description",
+            "status", "triggered_at", "applied_at", "applied_by", "applied_by_name",
+            "note", "rule_name",
+        )
+        read_only_fields = (
+            "id", "scope", "triggered_at", "applied_at", "applied_by",
+            "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at",
+        )
+
+    def get_rule_name(self, obj):
+        if obj.billing_rule_id:
+            return obj.billing_rule.name if obj.billing_rule else None
+        if obj.credit_rule_id:
+            return obj.credit_rule.name if obj.credit_rule else None
+        if obj.dispute_rule_id:
+            return obj.dispute_rule.name if obj.dispute_rule else None
+        return None
+
+    def get_applied_by_name(self, obj):
+        if obj.applied_by:
+            return obj.applied_by.get_full_name() or obj.applied_by.email
+        return None
 
 
 # =============================================================================
