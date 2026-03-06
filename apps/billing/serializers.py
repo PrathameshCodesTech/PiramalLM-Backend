@@ -651,8 +651,6 @@ class SiteBillingConfigCreateSerializer(serializers.ModelSerializer):
             "invoice_granularity", "billing_address_override", "default_gst_invoice_flag",
             "header_fields",
             "default_payment_term", "grace_period_days",
-            "early_payment_discount_percent", "early_payment_discount_days",
-            "late_fee_percent", "late_fee_flat_amount", "interest_rate_annual",
             "default_gst_rate", "gst_split_logic", "state_tax_rules",
             "revenue_gl", "gst_output_gl", "gst_input_gl", "receivables_gl",
             "late_fee_gl", "interest_gl"
@@ -666,13 +664,17 @@ class SiteBillingConfigCreateSerializer(serializers.ModelSerializer):
 class BillingRuleListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for list views."""
     owner_name = serializers.SerializerMethodField()
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    rate = serializers.DecimalField(max_digits=7, decimal_places=4, read_only=True)
+    grace_period_days = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = models.BillingRule
         fields = (
             "id", "rule_id", "name", "category", "applies_to",
-            "charge_type", "calculation_method", "trigger_event",
-            "status", "owner_name", "created_at"
+            "charge_type", "calculation_method", "amount", "rate",
+            "grace_period_days", "trigger_event",
+            "status", "owner_name", "created_at", "agreement"
         )
 
     def get_owner_name(self, obj):
@@ -729,7 +731,8 @@ class DisputeRuleListSerializer(serializers.ModelSerializer):
         model = models.DisputeRule
         fields = (
             "id", "name", "condition_type", "operator", "threshold_value",
-            "action_description", "priority", "status", "condition_display"
+            "action_description", "route_to_role", "priority", "status",
+            "condition_display", "agreement"
         )
 
     def get_condition_display(self, obj):
@@ -792,7 +795,8 @@ class CreditRuleListSerializer(serializers.ModelSerializer):
         model = models.CreditRule
         fields = (
             "id", "name", "trigger_type", "variance_threshold",
-            "variance_basis", "approval_role", "approval_role_name", "auto_approve", "status"
+            "variance_basis", "approval_role", "approval_role_name",
+            "auto_approve", "status", "agreement"
         )
 
 

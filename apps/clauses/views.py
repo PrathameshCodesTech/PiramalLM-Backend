@@ -121,7 +121,12 @@ class ClauseViewSet(InheritableScopedViewSet):
         if applies_to:
             queryset = queryset.filter(applies_to=applies_to)
 
-        return queryset.select_related("category", "owner")
+        # Filter by clause_type
+        clause_type = self.request.query_params.get("clause_type")
+        if clause_type:
+            queryset = queryset.filter(clause_type=clause_type)
+
+        return queryset.select_related("category", "owner").prefetch_related("versions")
 
     def perform_create(self, serializer):
         scope = self.get_active_scope()
@@ -445,23 +450,31 @@ class ClauseUsageViewSet(ScopedViewSet):
                 version_status=models.ClauseVersion.VersionStatus.CURRENT
             ).first()
 
-        serializer.save(
+        instance = serializer.save(
             scope=scope,
             clause_version=clause_version,
-            created_by=self.request.user
+            created_by=self.request.user,
         )
+        try:
+            instance.apply_to_agreement()
+        except Exception:
+            pass
 
     def perform_update(self, serializer):
-        serializer.save(updated_by=self.request.user)
+        instance = serializer.save(updated_by=self.request.user)
+        try:
+            instance.apply_to_agreement()
+        except Exception:
+            pass
 
     @action(detail=False, methods=["get"], url_path="by-agreement/(?P<agreement_id>[^/.]+)")
     def by_agreement(self, request, agreement_id=None):
-        """Get all clause usages for an agreement."""
+        """Get all clause usages for an agreement, ordered by sort_order."""
         scope = self.get_active_scope()
         usages = models.ClauseUsage.objects.filter(
             agreement_id=agreement_id,
             scope=scope
-        ).select_related("clause", "clause_version")
+        ).select_related("clause", "clause_version").order_by("sort_order", "id")
 
         serializer = self.get_serializer(usages, many=True)
         return Response(serializer.data)
@@ -477,6 +490,29 @@ class ClauseUsageViewSet(ScopedViewSet):
 
         serializer = self.get_serializer(usages, many=True)
         return Response(serializer.data)
+
+    @action(detail=False, methods=["post"], url_path="reorder")
+    def reorder(self, request):
+        """Reorder clause usages within an agreement section.
+
+        Payload: {"items": [{"id": 1, "sort_order": 0}, {"id": 2, "sort_order": 1}, ...]}
+        """
+        items = request.data.get("items")
+        if not isinstance(items, list):
+            return Response({"detail": "items must be a list."}, status=status.HTTP_400_BAD_REQUEST)
+
+        scope = self.get_active_scope()
+        ids = [item.get("id") for item in items if item.get("id") is not None]
+        usages = {u.id: u for u in models.ClauseUsage.objects.filter(id__in=ids, scope=scope)}
+
+        for item in items:
+            uid = item.get("id")
+            new_order = item.get("sort_order")
+            if uid in usages and new_order is not None:
+                usages[uid].sort_order = new_order
+
+        models.ClauseUsage.objects.bulk_update(list(usages.values()), ["sort_order"])
+        return Response({"detail": f"Reordered {len(usages)} clause(s)."})
 
 
 class ClauseLibraryStatsViewSet(InheritableScopedViewSet):

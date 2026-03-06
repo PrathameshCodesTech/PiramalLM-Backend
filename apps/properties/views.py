@@ -29,6 +29,8 @@ class SiteViewSet(SiteFullTreeMixin, ScopedViewSet):
     - GET/PUT/PATCH/DELETE /api/v1/properties/sites/{id}/
     - GET /api/v1/properties/sites/{id}/full-tree/  (aggregated data)
     """
+
+    rbac_module = "PROPERTY"
     queryset = models.Site.objects.all()
     serializer_class = serializers.SiteSerializer
     filter_backends = [SearchFilter, OrderingFilter]

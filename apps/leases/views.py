@@ -2,6 +2,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.exceptions import ValidationError as DRFValidationError, PermissionDenied
 from django.db.models import Q, Sum
 from django.http import HttpResponse
 from django.utils import timezone
@@ -308,6 +309,8 @@ class AgreementViewSet(ScopedViewSet):
     - GET /agreements/by-tenant/ - Filter by tenant
     """
 
+    rbac_module = "LEASE"
+
     queryset = models.Agreement.objects.all()
     serializer_class = serializers.AgreementSerializer
 
@@ -355,6 +358,8 @@ class AgreementViewSet(ScopedViewSet):
             "unit_allocations__tower",
             "unit_allocations__floor",
             "unit_allocations__unit",
+            "approval_steps",
+            "approval_steps__approver",
         )
 
     def perform_create(self, serializer):
@@ -366,6 +371,408 @@ class AgreementViewSet(ScopedViewSet):
 
     def perform_destroy(self, instance):
         instance.soft_delete()
+
+    def _derive_approval_params(self, agreement):
+        """
+        Derive (lease_value, tenant_type, lease_term_months) used for ApprovalRule matching.
+        """
+        agreement = models.Agreement.objects.select_related(
+            "term_dates", "financials", "tenant"
+        ).get(pk=agreement.pk)
+
+        lease_value = None
+        try:
+            fin = agreement.financials
+        except models.LeaseFinancials.DoesNotExist:
+            fin = None
+
+        if fin:
+            if fin.annual_rent is not None and fin.annual_rent > 0:
+                lease_value = float(fin.annual_rent)
+            elif fin.base_rent_monthly is not None and fin.base_rent_monthly > 0:
+                lease_value = float(fin.base_rent_monthly) * 12
+
+        tenant_type = getattr(agreement.tenant, "tenant_type", None) if agreement.tenant else None
+
+        lease_term_months = None
+        try:
+            td = agreement.term_dates
+        except models.LeaseTermDates.DoesNotExist:
+            td = None
+
+        if td:
+            if td.initial_term_months is not None:
+                lease_term_months = td.initial_term_months
+            elif td.commencement_date and td.expiry_date:
+                delta = td.expiry_date - td.commencement_date
+                lease_term_months = max(1, delta.days // 30)
+
+        return lease_value, tenant_type, lease_term_months
+
+    def _find_matching_approval_rule(self, agreement, lease_value, tenant_type, lease_term_months):
+        """
+        Find the first matching active ApprovalRule within agreement scope boundary.
+        Walks UP the hierarchy (entity → company → org) so rules defined at parent
+        scope levels are correctly found for entity-level agreements.
+        """
+        from apps.approvals.models import ApprovalRule
+
+        scope_ids = self._get_inheritable_scope_ids(agreement.scope)
+        for rule in (
+            ApprovalRule.objects.filter(
+                scope_id__in=scope_ids,
+                status=ApprovalRule.Status.ACTIVE,
+                is_active=True,
+            )
+            .prefetch_related("levels__role")
+            .order_by("lease_value_min", "id")
+        ):
+            if rule.matches(lease_value, tenant_type, lease_term_months):
+                return rule
+        return None
+
+    def _create_agreement_approval_steps(self, agreement, rule, user):
+        """
+        Replace agreement approval steps using the matched rule.
+        """
+        from datetime import timedelta
+
+        models.AgreementApproval.objects.filter(agreement=agreement).delete()
+        if not rule:
+            return []
+
+        now = timezone.now()
+        created_steps = []
+        for lvl in rule.levels.order_by("level"):
+            due_date = (now + timedelta(hours=lvl.sla_hours)).date() if lvl.sla_hours else None
+            created_steps.append(
+                models.AgreementApproval.objects.create(
+                    scope=agreement.scope,
+                    agreement=agreement,
+                    step_order=lvl.level,
+                    step_name=f"L{lvl.level} - {lvl.role.name}",
+                    step_description=(
+                        f"Approval from {lvl.role.name} ({lvl.sla_hours}h SLA)"
+                        if lvl.approval_required
+                        else f"Informational step for {lvl.role.name} ({lvl.sla_hours}h SLA)"
+                    ),
+                    approval_required=lvl.approval_required,
+                    approver_role=lvl.role.name,
+                    status=models.AgreementApproval.ApprovalStepStatus.PENDING,
+                    due_date=due_date,
+                    created_by=user,
+                )
+            )
+        return created_steps
+
+    def _get_inheritable_scope_ids(self, scope):
+        """
+        Return [current_scope_id, parent_scope_id, ...] for inheritable data lookup.
+        """
+        from apps.accounts.models import TenantScope
+
+        scope_ids = [scope.id]
+
+        if scope.scope_type == TenantScope.ScopeType.SITE and scope.site:
+            entity = scope.site.entity
+            if entity:
+                entity_scope = TenantScope.objects.filter(entity=entity, is_active=True).first()
+                if entity_scope:
+                    scope_ids.append(entity_scope.id)
+                company = entity.company
+                if company:
+                    company_scope = TenantScope.objects.filter(company=company, is_active=True).first()
+                    if company_scope:
+                        scope_ids.append(company_scope.id)
+                    org = company.org
+                    if org:
+                        org_scope = TenantScope.objects.filter(org=org, is_active=True).first()
+                        if org_scope:
+                            scope_ids.append(org_scope.id)
+        elif scope.scope_type == TenantScope.ScopeType.ENTITY and scope.entity:
+            company = scope.entity.company
+            if company:
+                company_scope = TenantScope.objects.filter(company=company, is_active=True).first()
+                if company_scope:
+                    scope_ids.append(company_scope.id)
+                org = company.org
+                if org:
+                    org_scope = TenantScope.objects.filter(org=org, is_active=True).first()
+                    if org_scope:
+                        scope_ids.append(org_scope.id)
+        elif scope.scope_type == TenantScope.ScopeType.COMPANY and scope.company:
+            org = scope.company.org
+            if org:
+                org_scope = TenantScope.objects.filter(org=org, is_active=True).first()
+                if org_scope:
+                    scope_ids.append(org_scope.id)
+
+        return scope_ids
+
+    def _build_clause_mapping_response(self, agreement):
+        from apps.clauses.models import Clause, ClauseVersion
+
+        mappings = agreement.clause_mapping_draft or []
+        def _to_int(value):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        clause_ids = [
+            _to_int(item.get("clause_id"))
+            for item in mappings
+            if isinstance(item, dict)
+        ]
+        clause_ids = [item for item in clause_ids if item is not None]
+        section_ids = [
+            _to_int(item.get("section_id"))
+            for item in mappings
+            if isinstance(item, dict)
+        ]
+        section_ids = [item for item in section_ids if item is not None]
+        version_ids = [
+            _to_int(item.get("clause_version_id"))
+            for item in mappings
+            if isinstance(item, dict)
+        ]
+        version_ids = [item for item in version_ids if item is not None]
+
+        clauses_by_id = {
+            clause.id: clause
+            for clause in Clause.objects.filter(id__in=clause_ids).select_related("category")
+        }
+        sections_by_id = {
+            section.id: section
+            for section in models.AgreementSection.objects.filter(id__in=section_ids)
+        }
+        versions_by_id = {
+            version.id: version
+            for version in ClauseVersion.objects.filter(id__in=version_ids)
+        }
+
+        enriched_mappings = []
+        for item in mappings:
+            if not isinstance(item, dict):
+                continue
+
+            clause_id = _to_int(item.get("clause_id"))
+            section_id = _to_int(item.get("section_id"))
+            clause_version_id = _to_int(item.get("clause_version_id"))
+
+            clause = clauses_by_id.get(clause_id)
+            section = sections_by_id.get(section_id)
+            version = versions_by_id.get(clause_version_id)
+
+            enriched_mappings.append(
+                {
+                    "clause_id": clause_id,
+                    "clause_title": clause.title if clause else None,
+                    "clause_code": clause.clause_id if clause else None,
+                    "clause_version_id": clause_version_id,
+                    "clause_version_label": version.version_label if version else None,
+                    "section_id": section_id,
+                    "section_name": section.name if section else None,
+                    "custom_config": item.get("custom_config", {}),
+                    "custom_body_text": item.get("custom_body_text", ""),
+                }
+            )
+
+        return {
+            "agreement_id": agreement.id,
+            "structure_id": agreement.structure_id,
+            "mappings": enriched_mappings,
+            "total_mappings": len(enriched_mappings),
+        }
+
+    def _normalize_clause_mappings(self, agreement, raw_mappings):
+        from apps.clauses.models import Clause, ClauseVersion
+
+        if raw_mappings is None:
+            return []
+
+        if not isinstance(raw_mappings, list):
+            raise DRFValidationError({"mappings": "Expected a list of clause mapping entries."})
+
+        inheritable_scope_ids = self._get_inheritable_scope_ids(agreement.scope)
+        allowed_clauses = {
+            clause.id: clause
+            for clause in Clause.objects.filter(
+                scope_id__in=inheritable_scope_ids,
+                is_active=True,
+                status=Clause.Status.ACTIVE,
+            )
+        }
+
+        allowed_sections = {}
+        if agreement.structure_id:
+            allowed_sections = {
+                section.id: section
+                for section in models.AgreementSection.objects.filter(
+                    structure_id=agreement.structure_id,
+                    is_active=True,
+                )
+            }
+
+        normalized = []
+        seen_clause_ids = set()
+
+        for idx, item in enumerate(raw_mappings):
+            if not isinstance(item, dict):
+                raise DRFValidationError({"mappings": f"Entry {idx + 1} must be an object."})
+
+            clause_id = item.get("clause_id")
+            if clause_id in (None, ""):
+                raise DRFValidationError({"mappings": f"Entry {idx + 1}: clause_id is required."})
+            try:
+                clause_id = int(clause_id)
+            except (TypeError, ValueError):
+                raise DRFValidationError({"mappings": f"Entry {idx + 1}: clause_id must be an integer."})
+
+            clause = allowed_clauses.get(clause_id)
+            if clause is None:
+                raise DRFValidationError(
+                    {"mappings": f"Entry {idx + 1}: clause_id {clause_id} is not visible or not ACTIVE."}
+                )
+            if clause_id in seen_clause_ids:
+                raise DRFValidationError({"mappings": f"Duplicate clause_id {clause_id} is not allowed."})
+            seen_clause_ids.add(clause_id)
+
+            section_id = item.get("section_id")
+            if section_id in ("", None):
+                section_id = None
+            else:
+                try:
+                    section_id = int(section_id)
+                except (TypeError, ValueError):
+                    raise DRFValidationError({"mappings": f"Entry {idx + 1}: section_id must be an integer."})
+
+            if agreement.structure_id:
+                if section_id is None:
+                    raise DRFValidationError(
+                        {"mappings": f"Entry {idx + 1}: section_id is required when structure is selected."}
+                    )
+                if section_id not in allowed_sections:
+                    raise DRFValidationError(
+                        {"mappings": f"Entry {idx + 1}: section_id {section_id} is not part of this structure."}
+                    )
+            elif section_id is not None:
+                raise DRFValidationError(
+                    {"mappings": f"Entry {idx + 1}: section_id is not allowed without agreement structure."}
+                )
+
+            clause_version_id = item.get("clause_version_id")
+            clause_version = None
+            if clause_version_id not in ("", None):
+                try:
+                    clause_version_id = int(clause_version_id)
+                except (TypeError, ValueError):
+                    raise DRFValidationError(
+                        {"mappings": f"Entry {idx + 1}: clause_version_id must be an integer."}
+                    )
+                clause_version = ClauseVersion.objects.filter(
+                    id=clause_version_id,
+                    clause_id=clause_id,
+                    is_active=True,
+                ).first()
+                if clause_version is None:
+                    raise DRFValidationError(
+                        {
+                            "mappings": (
+                                f"Entry {idx + 1}: clause_version_id {clause_version_id} "
+                                f"does not belong to clause_id {clause_id}."
+                            )
+                        }
+                    )
+            else:
+                clause_version = (
+                    ClauseVersion.objects.filter(
+                        clause_id=clause_id,
+                        version_status=ClauseVersion.VersionStatus.CURRENT,
+                        is_active=True,
+                    )
+                    .order_by("-major_version", "-minor_version")
+                    .first()
+                )
+                clause_version_id = clause_version.id if clause_version else None
+
+            custom_config = item.get("custom_config", {})
+            if custom_config in (None, ""):
+                custom_config = {}
+            if not isinstance(custom_config, dict):
+                raise DRFValidationError({"mappings": f"Entry {idx + 1}: custom_config must be an object."})
+
+            custom_body_text = item.get("custom_body_text", "")
+            if custom_body_text in (None,):
+                custom_body_text = ""
+            if not isinstance(custom_body_text, str):
+                raise DRFValidationError(
+                    {"mappings": f"Entry {idx + 1}: custom_body_text must be a string."}
+                )
+
+            normalized.append(
+                {
+                    "clause_id": clause_id,
+                    "clause_version_id": clause_version_id,
+                    "section_id": section_id,
+                    "custom_config": custom_config,
+                    "custom_body_text": custom_body_text,
+                }
+            )
+
+        return normalized
+
+    def _sync_clause_usages_from_draft(self, agreement, user):
+        from apps.clauses.models import ClauseUsage
+
+        mappings = self._normalize_clause_mappings(agreement, agreement.clause_mapping_draft or [])
+        mapping_by_clause_id = {item["clause_id"]: item for item in mappings}
+        mapped_clause_ids = set(mapping_by_clause_id.keys())
+
+        current_usages = ClauseUsage.objects.filter(
+            agreement=agreement,
+            scope=agreement.scope,
+        )
+        current_active_usages = current_usages.filter(is_active=True)
+
+        created_count = 0
+        updated_count = 0
+        deactivated_count = 0
+
+        for clause_id, mapping in mapping_by_clause_id.items():
+            usage, created = ClauseUsage.objects.update_or_create(
+                agreement=agreement,
+                clause_id=clause_id,
+                defaults={
+                    "scope": agreement.scope,
+                    "clause_version_id": mapping["clause_version_id"],
+                    "section_id": mapping["section_id"],
+                    "custom_config": mapping["custom_config"],
+                    "custom_body_text": mapping["custom_body_text"],
+                    "is_active": True,
+                    "deleted_at": None,
+                    "updated_by": user,
+                },
+            )
+            if created:
+                usage.created_by = user
+                usage.save(update_fields=["created_by"])
+                created_count += 1
+            else:
+                updated_count += 1
+
+        for usage in current_active_usages.exclude(clause_id__in=mapped_clause_ids):
+            usage.updated_by = user
+            usage.save(update_fields=["updated_by"])
+            usage.soft_delete()
+            deactivated_count += 1
+
+        return {
+            "created": created_count,
+            "updated": updated_count,
+            "deactivated": deactivated_count,
+            "total_mapped": len(mappings),
+        }
 
     @action(detail=True, methods=["get"])
     def terms(self, request, pk=None):
@@ -534,30 +941,102 @@ class AgreementViewSet(ScopedViewSet):
 
     @action(detail=True, methods=["post"])
     def submit(self, request, pk=None):
-        """Submit agreement for approval."""
+        """Submit agreement for approval and generate workflow steps from matching ApprovalRule."""
         agreement = self.get_object()
         if agreement.status != models.Agreement.Status.DRAFT:
             return Response(
                 {"error": "Only draft agreements can be submitted"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        clause_sync = self._sync_clause_usages_from_draft(agreement, request.user)
+
+        lease_value, tenant_type, lease_term_months = self._derive_approval_params(agreement)
+        matched_rule = self._find_matching_approval_rule(
+            agreement,
+            lease_value,
+            tenant_type,
+            lease_term_months,
+        )
+        created_steps = self._create_agreement_approval_steps(
+            agreement,
+            matched_rule,
+            request.user,
+        )
+
         agreement.status = models.Agreement.Status.PENDING
         agreement.updated_by = request.user
-        agreement.save()
-        return Response(serializers.AgreementSerializer(agreement).data)
+        agreement.save(update_fields=["status", "updated_by", "updated_at"])
+
+        response_data = serializers.AgreementSerializer(agreement).data
+        response_data["approval_steps_created"] = len(created_steps)
+        response_data["approval_rule"] = (
+            {
+                "id": matched_rule.id,
+                "name": matched_rule.name,
+            }
+            if matched_rule
+            else None
+        )
+        response_data["clause_usage_sync"] = clause_sync
+        return Response(response_data)
+
+    @action(detail=True, methods=["get", "patch"], url_path="clause-mappings")
+    def clause_mappings(self, request, pk=None):
+        """
+        Get or update agreement-level clause-to-section mapping draft.
+        """
+        agreement = self.get_object()
+
+        if request.method == "GET":
+            return Response(self._build_clause_mapping_response(agreement))
+
+        mappings = request.data.get("mappings")
+        normalized = self._normalize_clause_mappings(agreement, mappings)
+        agreement.clause_mapping_draft = normalized
+        agreement.updated_by = request.user
+        agreement.save(update_fields=["clause_mapping_draft", "updated_by", "updated_at"])
+
+        return Response(self._build_clause_mapping_response(agreement))
 
     @action(detail=True, methods=["post"])
     def activate(self, request, pk=None):
-        """Activate a pending agreement."""
+        """Activate a pending agreement after required approval steps are completed."""
         agreement = self.get_object()
         if agreement.status != models.Agreement.Status.PENDING:
             return Response(
                 {"error": "Only pending agreements can be activated"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        required_steps = agreement.approval_steps.filter(
+            is_active=True,
+            approval_required=True,
+        )
+        rejected_count = required_steps.filter(
+            status=models.AgreementApproval.ApprovalStepStatus.REJECTED
+        ).count()
+        if rejected_count > 0:
+            return Response(
+                {"error": "Agreement has rejected approval step(s) and cannot be activated."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        incomplete_count = required_steps.exclude(
+            status__in=[
+                models.AgreementApproval.ApprovalStepStatus.APPROVED,
+                models.AgreementApproval.ApprovalStepStatus.SKIPPED,
+            ]
+        ).count()
+        if incomplete_count > 0:
+            return Response(
+                {"error": f"{incomplete_count} required approval step(s) are still pending."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         agreement.status = models.Agreement.Status.ACTIVE
         agreement.updated_by = request.user
-        agreement.save()
+        agreement.save(update_fields=["status", "updated_by", "updated_at"])
         return Response(serializers.AgreementSerializer(agreement).data)
 
     @action(detail=True, methods=["post"])
@@ -586,6 +1065,161 @@ class AgreementViewSet(ScopedViewSet):
         queryset = self.get_queryset().filter(tenant_id=tenant_id)
         serializer = serializers.AgreementListSerializer(queryset, many=True)
         return Response(serializer.data)
+
+
+class AgreementApprovalViewSet(ScopedViewSet):
+    """
+    ViewSet for agreement approval workflow steps.
+
+    Endpoints:
+    - GET /agreement-approvals/ - List approval steps (filter by agreement_id/status)
+    - POST /agreement-approvals/ - Create approval step
+    - PATCH /agreement-approvals/{id}/ - Update step
+    - POST /agreement-approvals/{id}/action/ - Approve/reject/skip a step
+    """
+
+    queryset = models.AgreementApproval.objects.all()
+    serializer_class = serializers.AgreementApprovalSerializer
+    AGREEMENT_APPROVE_PERMISSION_CODES = {
+        "agreements.approve",
+        "agreement.approve",
+        "lease.approve",
+        "lease.agreement.approve",
+        "lease.agreements.approve",
+        "leases.approve",
+        "leases.agreement.approve",
+        "leases.agreements.approve",
+        "approvals.approve",
+    }
+
+    def _get_active_membership_for_request_user(self):
+        from apps.accounts.models import ScopeMembership
+
+        scope = self.get_active_scope()
+        if scope is None:
+            return None
+
+        return (
+            ScopeMembership.objects.filter(
+                user=self.request.user,
+                scope=scope,
+                is_active=True,
+            )
+            .select_related("role")
+            .prefetch_related("role__module_permissions", "role__role_permissions__permission")
+            .first()
+        )
+
+    def _has_agreement_approve_permission(self, role):
+        from apps.accounts.models import ModulePermission
+
+        if role.role_type == role.RoleType.ADMIN:
+            return True
+
+        if role.module_permissions.filter(
+            module__in=[
+                ModulePermission.Module.LEASE,
+                ModulePermission.Module.APPROVALS,
+            ],
+            can_approve=True,
+            is_active=True,
+        ).exists():
+            return True
+
+        permission_codes = set(
+            role.role_permissions.filter(is_active=True).values_list(
+                "permission__code", flat=True
+            )
+        )
+        return bool(permission_codes.intersection(self.AGREEMENT_APPROVE_PERMISSION_CODES))
+
+    def _validate_agreement_approval_access(self, approval):
+        if self.request.user.is_superuser:
+            return
+
+        membership = self._get_active_membership_for_request_user()
+        if not membership or not membership.role:
+            raise PermissionDenied(
+                "You do not have an active role membership in the selected scope to action this approval."
+            )
+
+        role = membership.role
+        required_role = (approval.approver_role or "").strip()
+        if required_role:
+            required_role_lower = required_role.lower()
+            role_matches = (
+                (role.name or "").strip().lower() == required_role_lower
+                or (role.code or "").strip().lower() == required_role_lower
+            )
+            if not role_matches:
+                raise PermissionDenied(
+                    f"This approval step requires role '{approval.approver_role}'. "
+                    f"Your active role is '{role.name}'."
+                )
+
+        if approval.approver_id and approval.approver_id != self.request.user.id:
+            raise PermissionDenied("This approval step is assigned to a different approver.")
+
+        if not self._has_agreement_approve_permission(role):
+            raise PermissionDenied("Your active role does not have agreement approval permission.")
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        agreement_id = self.request.query_params.get("agreement_id")
+        if agreement_id:
+            queryset = queryset.filter(agreement_id=agreement_id)
+
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        return queryset.select_related("agreement", "approver").order_by("agreement_id", "step_order")
+
+    def perform_create(self, serializer):
+        scope = self.get_active_scope()
+        serializer.save(scope=scope, created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+    @action(detail=True, methods=["post"])
+    def action(self, request, pk=None):
+        """Take action on a workflow step: approve/reject/skip."""
+        approval = self.get_object()
+        action_type = request.data.get("action")
+        comments = request.data.get("comments", "")
+
+        if action_type not in ["approve", "reject", "skip"]:
+            return Response(
+                {"error": "Action must be 'approve', 'reject', or 'skip'"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if approval.status != models.AgreementApproval.ApprovalStepStatus.PENDING:
+            return Response(
+                {"error": "Approval step is not pending"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        self._validate_agreement_approval_access(approval)
+
+        if action_type == "approve":
+            approval.status = models.AgreementApproval.ApprovalStepStatus.APPROVED
+        elif action_type == "reject":
+            approval.status = models.AgreementApproval.ApprovalStepStatus.REJECTED
+        else:
+            approval.status = models.AgreementApproval.ApprovalStepStatus.SKIPPED
+
+        approval.approver = request.user
+        approval.actioned_at = timezone.now()
+        approval.comments = comments
+        approval.updated_by = request.user
+        approval.save(
+            update_fields=[
+                "status", "approver", "actioned_at", "comments", "updated_by", "updated_at"
+            ]
+        )
+        return Response(serializers.AgreementApprovalSerializer(approval).data)
 
 
 class UnitAllocationViewSet(ScopedViewSet):
@@ -904,8 +1538,32 @@ class LeaseAmendmentViewSet(ScopedViewSet):
                 delta = td.expiry_date - td.commencement_date
                 lease_term_months = max(1, delta.days // 30)
 
-        # Find matching active ApprovalRule (same logic as Simulator)
-        scope_ids = list(amendment.scope.get_child_scopes().values_list("id", flat=True))
+        # Find matching active ApprovalRule - walk UP hierarchy (entity → company → org)
+        # so rules defined at parent scope levels are found for entity-level amendments.
+        from apps.accounts.models import TenantScope as _TenantScope
+
+        def _inheritable_ids(scope):
+            ids = [scope.id]
+            if scope.scope_type == _TenantScope.ScopeType.ENTITY and scope.entity:
+                company = scope.entity.company
+                if company:
+                    cs = _TenantScope.objects.filter(company=company, is_active=True).first()
+                    if cs:
+                        ids.append(cs.id)
+                    org = company.org
+                    if org:
+                        os_ = _TenantScope.objects.filter(org=org, is_active=True).first()
+                        if os_:
+                            ids.append(os_.id)
+            elif scope.scope_type == _TenantScope.ScopeType.COMPANY and scope.company:
+                org = scope.company.org
+                if org:
+                    os_ = _TenantScope.objects.filter(org=org, is_active=True).first()
+                    if os_:
+                        ids.append(os_.id)
+            return ids
+
+        scope_ids = _inheritable_ids(amendment.scope)
         matched_rule = None
         for rule in ApprovalRule.objects.filter(
             scope_id__in=scope_ids,
@@ -919,9 +1577,9 @@ class LeaseAmendmentViewSet(ScopedViewSet):
         # Create AmendmentApproval steps from matched rule
         if matched_rule:
             levels = list(matched_rule.levels.order_by("level"))
-            today = timezone.now().date()
+            now = timezone.now()
             for lvl in levels:
-                due_date = today + timedelta(hours=lvl.sla_hours) if lvl.sla_hours else None
+                due_date = (now + timedelta(hours=lvl.sla_hours)).date() if lvl.sla_hours else None
                 models.AmendmentApproval.objects.create(
                     scope=amendment.scope,
                     amendment=amendment,
@@ -958,20 +1616,67 @@ class LeaseAmendmentViewSet(ScopedViewSet):
 
     @action(detail=True, methods=["post"])
     def execute(self, request, pk=None):
-        """Execute approved amendment."""
+        """Execute approved amendment — apply structured changes to agreement fields."""
         amendment = self.get_object()
         if amendment.approval_status != models.LeaseAmendment.ApprovalStatus.APPROVED:
             return Response(
                 {"error": "Only approved amendments can be executed"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
         amendment.approval_status = models.LeaseAmendment.ApprovalStatus.EXECUTED
         amendment.executed_date = timezone.now().date()
         amendment.updated_by = request.user
         amendment.save()
 
-        # Update agreement version
+        # Apply structured changes to agreement sub-models
         agreement = amendment.agreement
+        data = amendment.amendment_data or {}
+        atype = amendment.amendment_type
+
+        if atype == models.LeaseAmendment.AmendmentType.RENT_REVISION:
+            if "base_rent_monthly" in data:
+                try:
+                    fin = agreement.financials
+                    fin.base_rent_monthly = data["base_rent_monthly"]
+                    fin.updated_by = request.user
+                    fin.save(update_fields=["base_rent_monthly", "updated_by", "updated_at"])
+                except models.LeaseFinancials.DoesNotExist:
+                    pass
+
+        elif atype in (
+            models.LeaseAmendment.AmendmentType.TERM_EXTENSION,
+            models.LeaseAmendment.AmendmentType.RENEWAL,
+        ):
+            try:
+                td = agreement.term_dates
+                if "expiry_date" in data:
+                    td.expiry_date = data["expiry_date"]
+                if "initial_term_months" in data:
+                    td.initial_term_months = data["initial_term_months"]
+                td.updated_by = request.user
+                td.save(update_fields=["expiry_date", "initial_term_months", "updated_by", "updated_at"])
+            except models.LeaseTermDates.DoesNotExist:
+                pass
+
+        elif atype == models.LeaseAmendment.AmendmentType.EARLY_TERMINATION:
+            if "termination_date" in data:
+                try:
+                    td = agreement.term_dates
+                    td.expiry_date = data["termination_date"]
+                    td.updated_by = request.user
+                    td.save(update_fields=["expiry_date", "updated_by", "updated_at"])
+                except models.LeaseTermDates.DoesNotExist:
+                    pass
+                agreement.status = models.Agreement.AgreementStatus.TERMINATED
+                agreement.updated_by = request.user
+
+        elif atype == models.LeaseAmendment.AmendmentType.PARTY_CHANGE:
+            if "new_tenant_id" in data:
+                agreement.tenant_id = data["new_tenant_id"]
+                agreement.updated_by = request.user
+
+        # Always bump version
         agreement.version_number = amendment.new_version
         agreement.updated_by = request.user
         agreement.save()
@@ -1026,6 +1731,91 @@ class AmendmentApprovalViewSet(ScopedViewSet):
 
     queryset = models.AmendmentApproval.objects.all()
     serializer_class = serializers.AmendmentApprovalSerializer
+    AMENDMENT_APPROVE_PERMISSION_CODES = {
+        "amendments.approve",
+        "amendment.approve",
+        "lease.approve",
+        "lease.amendment.approve",
+        "lease.amendments.approve",
+        "leases.approve",
+        "leases.amendment.approve",
+        "leases.amendments.approve",
+        "approvals.approve",
+    }
+
+    def _get_active_membership_for_request_user(self):
+        from apps.accounts.models import ScopeMembership
+
+        scope = self.get_active_scope()
+        if scope is None:
+            return None
+
+        return (
+            ScopeMembership.objects.filter(
+                user=self.request.user,
+                scope=scope,
+                is_active=True,
+            )
+            .select_related("role")
+            .prefetch_related("role__module_permissions", "role__role_permissions__permission")
+            .first()
+        )
+
+    def _has_amendment_approve_permission(self, role):
+        from apps.accounts.models import ModulePermission
+
+        if role.role_type == role.RoleType.ADMIN:
+            return True
+
+        if role.can_approve_amendments:
+            return True
+
+        if role.module_permissions.filter(
+            module__in=[
+                ModulePermission.Module.LEASE,
+                ModulePermission.Module.APPROVALS,
+            ],
+            can_approve=True,
+            is_active=True,
+        ).exists():
+            return True
+
+        permission_codes = set(
+            role.role_permissions.filter(is_active=True).values_list(
+                "permission__code", flat=True
+            )
+        )
+        return bool(permission_codes.intersection(self.AMENDMENT_APPROVE_PERMISSION_CODES))
+
+    def _validate_amendment_approval_access(self, approval):
+        if self.request.user.is_superuser:
+            return
+
+        membership = self._get_active_membership_for_request_user()
+        if not membership or not membership.role:
+            raise PermissionDenied(
+                "You do not have an active role membership in the selected scope to action this approval."
+            )
+
+        role = membership.role
+        required_role = (approval.approver_role or "").strip()
+        if required_role:
+            required_role_lower = required_role.lower()
+            role_matches = (
+                (role.name or "").strip().lower() == required_role_lower
+                or (role.code or "").strip().lower() == required_role_lower
+            )
+            if not role_matches:
+                raise PermissionDenied(
+                    f"This approval step requires role '{approval.approver_role}'. "
+                    f"Your active role is '{role.name}'."
+                )
+
+        if approval.approver_id and approval.approver_id != self.request.user.id:
+            raise PermissionDenied("This approval step is assigned to a different approver.")
+
+        if not self._has_amendment_approve_permission(role):
+            raise PermissionDenied("Your active role does not have amendment approval permission.")
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -1066,6 +1856,8 @@ class AmendmentApprovalViewSet(ScopedViewSet):
                 {"error": "Approval step is not pending"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        self._validate_amendment_approval_access(approval)
 
         if action_type == "approve":
             approval.status = models.AmendmentApproval.ApprovalStepStatus.APPROVED
@@ -1255,6 +2047,84 @@ class DocumentApprovalViewSet(ScopedViewSet):
     queryset = models.DocumentApproval.objects.all()
     serializer_class = serializers.DocumentApprovalSerializer
 
+    DOC_APPROVE_PERMISSION_CODES = {
+        "documents.approve",
+        "document.approve",
+        "lease.documents.approve",
+        "lease.document.approve",
+        "leases.documents.approve",
+    }
+
+    def _get_active_membership_for_request_user(self):
+        from apps.accounts.models import ScopeMembership
+
+        scope = self.get_active_scope()
+        if scope is None:
+            return None
+
+        return (
+            ScopeMembership.objects.filter(
+                user=self.request.user,
+                scope=scope,
+                is_active=True,
+            )
+            .select_related("role")
+            .prefetch_related("role__module_permissions", "role__role_permissions__permission")
+            .first()
+        )
+
+    def _has_document_approve_permission(self, role):
+        from apps.accounts.models import ModulePermission
+
+        if role.role_type == role.RoleType.ADMIN:
+            return True
+
+        if role.module_permissions.filter(
+            module=ModulePermission.Module.DOCUMENTS,
+            can_approve=True,
+            is_active=True,
+        ).exists():
+            return True
+
+        permission_codes = set(
+            role.role_permissions.filter(is_active=True).values_list(
+                "permission__code", flat=True
+            )
+        )
+        return bool(permission_codes.intersection(self.DOC_APPROVE_PERMISSION_CODES))
+
+    def _validate_document_approval_access(self, approval):
+        if self.request.user.is_superuser:
+            return
+
+        membership = self._get_active_membership_for_request_user()
+        if not membership or not membership.role:
+            raise PermissionDenied(
+                "You do not have an active role membership in the selected scope to action this approval."
+            )
+
+        role = membership.role
+        required_role = (approval.approver_role or "").strip()
+        if required_role:
+            required_role_lower = required_role.lower()
+            role_matches = (
+                (role.name or "").strip().lower() == required_role_lower
+                or (role.code or "").strip().lower() == required_role_lower
+            )
+            if not role_matches:
+                raise PermissionDenied(
+                    f"This approval step requires role '{approval.approver_role}'. "
+                    f"Your active role is '{role.name}'."
+                )
+
+        if approval.approver_id and approval.approver_id != self.request.user.id:
+            raise PermissionDenied("This approval step is assigned to a different approver.")
+
+        if not self._has_document_approve_permission(role):
+            raise PermissionDenied(
+                "Your active role does not have document approval permission."
+            )
+
     def get_queryset(self):
         queryset = super().get_queryset()
 
@@ -1290,6 +2160,8 @@ class DocumentApprovalViewSet(ScopedViewSet):
                 {"error": "Approval step is not pending"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        self._validate_document_approval_access(approval)
 
         if action_type == "approve":
             approval.status = models.DocumentApproval.ApprovalStatus.APPROVED

@@ -468,6 +468,25 @@ class LeaseDisputeResolutionSerializer(serializers.ModelSerializer):
         )
 
 
+# ===================== Agreement Approval Serializers =====================
+
+class AgreementApprovalSerializer(serializers.ModelSerializer):
+    approver_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.AgreementApproval
+        fields = "__all__"
+        read_only_fields = (
+            "id", "scope", "created_at", "updated_at",
+            "created_by", "updated_by", "is_active", "deleted_at"
+        )
+
+    def get_approver_name(self, obj):
+        if obj.approver:
+            return obj.approver.get_full_name() or obj.approver.email
+        return None
+
+
 # ===================== Amendment Serializers =====================
 
 class AmendmentApprovalSerializer(serializers.ModelSerializer):
@@ -559,10 +578,12 @@ class LeaseAmendmentCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.LeaseAmendment
         fields = (
-            "agreement", "amendment_type", "title", "previous_version",
+            "id", "agreement", "amendment_id", "amendment_type", "title", "previous_version",
             "new_version", "is_major_version", "amendment_date", "effective_from",
-            "effective_to", "changes_summary", "description", "reason", "initiated_by"
+            "effective_to", "approval_status", "changes_summary", "amendment_data",
+            "description", "reason", "initiated_by"
         )
+        read_only_fields = ("id", "amendment_id", "approval_status")
 
 
 # ===================== Linked Document Serializers =====================
@@ -872,6 +893,7 @@ class AgreementDetailSerializer(serializers.ModelSerializer):
     # Amendment & Document collections
     amendments = serializers.SerializerMethodField()
     linked_documents = serializers.SerializerMethodField()
+    approval_steps = AgreementApprovalSerializer(many=True, read_only=True)
 
     # Computed fields
     total_allocated_area = serializers.SerializerMethodField()

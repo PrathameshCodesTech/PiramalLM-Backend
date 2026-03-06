@@ -10,8 +10,13 @@ Entry points:
 
   RulesEngine.check_dispute_rules(invoice, scope, user)
       → called after Invoice is marked DISPUTED
+
+  RulesEngine.check_billing_rules(invoice, scope, user=None)
+      → called by the nightly process_overdue_invoices management command
+        for each invoice that is currently OVERDUE
 """
 
+from datetime import timedelta
 from decimal import Decimal
 from django.utils import timezone
 from . import models
@@ -126,6 +131,7 @@ class RulesEngine:
     def check_credit_rules(credit_note, scope, user):
         """
         Called after a CreditNote is created.
+        Checks agreement-specific CreditRules first; falls back to scope-level rules.
         Finds the first matching ACTIVE CreditRule and either:
           - AUTO: sets status/approval on the CN and logs an APPLIED action
           - MANUAL: creates a PENDING action for the user to review
@@ -134,11 +140,27 @@ class RulesEngine:
         if not trigger_type:
             return  # No mapping — nothing to check
 
-        rules = models.CreditRule.objects.filter(
-            scope=scope,
-            status=models.CreditRule.RuleStatus.ACTIVE,
-            trigger_type=trigger_type,
+        # Agreement-specific rules take priority over scope-level rules
+        agreement = getattr(credit_note, "agreement", None) or getattr(
+            credit_note.invoice, "agreement", None
         )
+        rules = None
+        if agreement:
+            agreement_rules = models.CreditRule.objects.filter(
+                agreement=agreement,
+                status=models.CreditRule.RuleStatus.ACTIVE,
+                trigger_type=trigger_type,
+            )
+            if agreement_rules.exists():
+                rules = agreement_rules
+
+        if rules is None:
+            rules = models.CreditRule.objects.filter(
+                scope=scope,
+                agreement__isnull=True,
+                status=models.CreditRule.RuleStatus.ACTIVE,
+                trigger_type=trigger_type,
+            )
 
         for rule in rules:
             if not _credit_rule_matches(rule, credit_note):
@@ -191,14 +213,27 @@ class RulesEngine:
     def check_dispute_rules(invoice, scope, user):
         """
         Called when an Invoice is disputed.
+        Checks agreement-specific DisputeRules first; falls back to scope-level rules.
         Finds the first matching ACTIVE DisputeRule (by priority) and either:
           - AUTO: applies hold/SLA immediately and logs an APPLIED action
           - MANUAL: creates a PENDING action for the user to review
         """
-        rules = models.DisputeRule.objects.filter(
-            scope=scope,
-            status=models.DisputeRule.RuleStatus.ACTIVE,
-        ).order_by("priority")
+        # Agreement-specific rules take priority
+        rules = None
+        if invoice.agreement_id:
+            agreement_rules = models.DisputeRule.objects.filter(
+                agreement=invoice.agreement,
+                status=models.DisputeRule.RuleStatus.ACTIVE,
+            ).order_by("priority")
+            if agreement_rules.exists():
+                rules = agreement_rules
+
+        if rules is None:
+            rules = models.DisputeRule.objects.filter(
+                scope=scope,
+                agreement__isnull=True,
+                status=models.DisputeRule.RuleStatus.ACTIVE,
+            ).order_by("priority")
 
         for rule in rules:
             if not _evaluate(rule.condition_type, rule.operator, rule.threshold_value, invoice):
@@ -253,3 +288,170 @@ class RulesEngine:
                 )
 
             break  # Only the highest-priority matching rule fires
+
+    @staticmethod
+    def check_billing_rules(invoice, scope, user=None):
+        """
+        Called by the nightly process_overdue_invoices command for each OVERDUE invoice.
+        Checks agreement-specific BillingRules first; falls back to scope-level rules.
+
+        Finds all ACTIVE BillingRules with trigger_event=OVERDUE and:
+          - Skips rules whose grace_period_days haven't elapsed yet
+          - AUTO: creates a new LATE_FEE Invoice and logs an APPLIED action
+          - MANUAL: creates a PENDING action for the user to review
+
+        Only the first matching rule fires per invoice (same pattern as credit/dispute rules).
+        """
+        today = timezone.now().date()
+        overdue_days = (today - invoice.due_date).days
+
+        # Agreement-specific rules take priority over scope-level rules
+        rules = None
+        if invoice.agreement_id:
+            agreement_rules = models.BillingRule.objects.filter(
+                agreement=invoice.agreement,
+                status=models.BillingRule.RuleStatus.ACTIVE,
+                trigger_event=models.BillingRule.TriggerEvent.OVERDUE,
+            )
+            if agreement_rules.exists():
+                rules = agreement_rules
+
+        if rules is None:
+            rules = models.BillingRule.objects.filter(
+                scope=scope,
+                agreement__isnull=True,
+                status=models.BillingRule.RuleStatus.ACTIVE,
+                trigger_event=models.BillingRule.TriggerEvent.OVERDUE,
+            )
+
+        for rule in rules:
+            # Respect grace period
+            if overdue_days < rule.grace_period_days:
+                continue
+
+            charge = _calculate_billing_charge(rule, invoice, overdue_days)
+            if charge <= 0:
+                continue
+
+            # Apply cap
+            if rule.max_cap_amount and charge > rule.max_cap_amount:
+                charge = rule.max_cap_amount
+
+            desc = (
+                f"Billing Rule '{rule.name}' [{rule.get_charge_type_display()}]: "
+                f"₹{charge:.2f} on Invoice {invoice.invoice_number} "
+                f"({overdue_days} days overdue)"
+            )
+
+            if rule.trigger_mode == models.BillingRule.TriggerMode.AUTO:
+                _create_late_fee_invoice(invoice, rule, charge, today)
+                _create_pending(
+                    scope=scope, user=user,
+                    rule_type_val=models.PendingAction.RuleType.BILLING,
+                    rule_kwargs={"billing_rule": rule},
+                    obj_type_val=models.PendingAction.ObjectType.INVOICE,
+                    obj_id=invoice.id,
+                    desc=f"[AUTO] {desc}",
+                    status_val=models.PendingAction.Status.APPLIED,
+                    applied_at=timezone.now(),
+                    applied_by=user,
+                )
+            else:
+                _create_pending(
+                    scope=scope, user=user,
+                    rule_type_val=models.PendingAction.RuleType.BILLING,
+                    rule_kwargs={"billing_rule": rule},
+                    obj_type_val=models.PendingAction.ObjectType.INVOICE,
+                    obj_id=invoice.id,
+                    desc=desc,
+                )
+
+            break  # Only the first matching billing rule fires per invoice
+
+
+# ---------------------------------------------------------------------------
+# Billing Rule evaluation helpers
+# ---------------------------------------------------------------------------
+
+def _calculate_billing_charge(rule, invoice, overdue_days):
+    """
+    Calculate the late-fee / penalty charge for a BillingRule.
+    Returns a Decimal charge amount (>= 0).
+    """
+    balance = invoice.balance_due
+
+    if rule.calculation_method == models.BillingRule.CalculationMethod.FLAT:
+        return rule.amount or Decimal("0")
+
+    if rule.calculation_method == models.BillingRule.CalculationMethod.PERCENTAGE_OF_OUTSTANDING:
+        if rule.rate:
+            return balance * (rule.rate / 100)
+        return Decimal("0")
+
+    if rule.calculation_method == models.BillingRule.CalculationMethod.PERCENTAGE_OF_RENT:
+        rent = Decimal("0")
+        try:
+            rent = invoice.agreement.financials.base_rent_monthly or Decimal("0")
+        except Exception:
+            pass
+        if rule.rate:
+            return rent * (rule.rate / 100)
+        return Decimal("0")
+
+    if rule.calculation_method == models.BillingRule.CalculationMethod.PER_DAY:
+        if rule.amount:
+            return rule.amount * Decimal(str(overdue_days))
+        return Decimal("0")
+
+    return Decimal("0")
+
+
+def _create_late_fee_invoice(invoice, rule, charge, today):
+    """
+    Create a new LATE_FEE Invoice linked to the same agreement.
+    Also adds a single InvoiceLineItem for the charge.
+    """
+    new_number = f"LF-{invoice.invoice_number}-{today.strftime('%Y%m%d')}"
+
+    due_date = today
+    try:
+        site = invoice.agreement.site
+        config = models.SiteBillingConfig.objects.get(site=site, scope=invoice.scope)
+        term_days_map = {
+            "DUE_ON_RECEIPT": 0, "NET_7": 7, "NET_15": 15,
+            "NET_30": 30, "NET_45": 45, "NET_60": 60,
+        }
+        due_date = today + timedelta(days=term_days_map.get(config.default_payment_term, 0))
+    except Exception:
+        pass
+
+    late_inv = models.Invoice.objects.create(
+        scope=invoice.scope,
+        agreement=invoice.agreement,
+        invoice_number=new_number,
+        invoice_type=models.Invoice.InvoiceType.LATE_FEE,
+        status=models.Invoice.InvoiceStatus.PENDING,
+        invoice_date=today,
+        due_date=due_date,
+        subtotal=charge,
+        tax_amount=Decimal("0"),
+        total_amount=charge,
+        amount_paid=Decimal("0"),
+        balance_due=charge,
+        notes=(
+            f"Auto-generated by Billing Rule '{rule.name}' "
+            f"for overdue Invoice {invoice.invoice_number}"
+        ),
+    )
+
+    models.InvoiceLineItem.objects.create(
+        invoice=late_inv,
+        scope=invoice.scope,
+        item_type=models.InvoiceLineItem.LineItemType.LATE_FEE,
+        description=f"{rule.get_charge_type_display()} – {rule.name}",
+        quantity=Decimal("1"),
+        unit_price=charge,
+        tax_rate=Decimal("0"),
+    )
+
+    return late_inv

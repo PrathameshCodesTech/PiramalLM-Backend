@@ -535,6 +535,7 @@ class TenantScopeViewSet(ModelViewSet):
     queryset = models.TenantScope.objects.all()
     serializer_class = serializers.TenantScopeSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = None  # Return all scopes — used as a reference dropdown
 
     def get_queryset(self):
         user = self.request.user

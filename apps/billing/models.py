@@ -210,6 +210,11 @@ class SiteBillingConfig(TenantModel):
         default="YEARLY",
         help_text="When to reset the invoice counter"
     )
+    counter_last_reset = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Date the invoice counter was last reset"
+    )
     counter_padding = models.PositiveIntegerField(
         default=4,
         help_text="Zero-padding for counter (4 = 0001)"
@@ -281,39 +286,6 @@ class SiteBillingConfig(TenantModel):
     grace_period_days = models.PositiveIntegerField(
         default=7,
         help_text="Grace period in days after due date"
-    )
-    early_payment_discount_percent = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=Decimal("0.00"),
-        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
-        help_text="Early payment discount percentage"
-    )
-    early_payment_discount_days = models.PositiveIntegerField(
-        default=0,
-        help_text="Days within which early payment discount applies"
-    )
-    late_fee_percent = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=Decimal("0.00"),
-        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
-        help_text="Late fee percentage"
-    )
-    late_fee_flat_amount = models.DecimalField(
-        max_digits=14,
-        decimal_places=2,
-        null=True,
-        blank=True,
-        validators=[MinValueValidator(Decimal("0"))],
-        help_text="Flat late fee amount (alternative to percentage)"
-    )
-    interest_rate_annual = models.DecimalField(
-        max_digits=5,
-        decimal_places=2,
-        default=Decimal("0.00"),
-        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
-        help_text="Annual interest rate for overdue invoices"
     )
 
     # =========================================================================
@@ -390,9 +362,26 @@ class SiteBillingConfig(TenantModel):
             raise ValidationError("SiteBillingConfig scope must match Site scope.")
 
     def get_next_invoice_number(self):
-        """Generate next invoice number based on pattern."""
-        from datetime import datetime
+        """Generate next invoice number based on pattern, resetting counter per frequency."""
+        from datetime import date, datetime
         now = datetime.now()
+        today = date.today()
+
+        # Reset counter if frequency demands it
+        update_fields = ["current_counter"]
+        if self.counter_reset_frequency == "YEARLY":
+            if self.counter_last_reset is None or self.counter_last_reset.year < today.year:
+                self.current_counter = 1
+                self.counter_last_reset = today
+                update_fields.append("counter_last_reset")
+        elif self.counter_reset_frequency == "MONTHLY":
+            if self.counter_last_reset is None or (
+                self.counter_last_reset.year < today.year
+                or self.counter_last_reset.month < today.month
+            ):
+                self.current_counter = 1
+                self.counter_last_reset = today
+                update_fields.append("counter_last_reset")
 
         number = self.invoice_pattern
         if self.include_property_code:
@@ -409,9 +398,8 @@ class SiteBillingConfig(TenantModel):
         counter_str = str(self.current_counter).zfill(self.counter_padding)
         number = number.replace("{COUNTER}", counter_str)
 
-        # Increment counter
         self.current_counter += 1
-        self.save(update_fields=["current_counter"])
+        self.save(update_fields=update_fields)
 
         return number
 
@@ -565,6 +553,16 @@ class BillingRule(TenantModel):
         null=True,
         blank=True,
         related_name="owned_billing_rules"
+    )
+
+    # Agreement-level override (null = scope-level, applies to all agreements)
+    agreement = models.ForeignKey(
+        "leases.Agreement",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="billing_rules",
+        help_text="If set, this rule only applies to this specific agreement"
     )
 
     class Meta:
@@ -722,16 +720,20 @@ class DisputeRule(TenantModel):
         help_text="MANUAL = create a pending action alert; AUTO = fire immediately"
     )
 
+    # Agreement-level override (null = scope-level, applies to all agreements)
+    agreement = models.ForeignKey(
+        "leases.Agreement",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="dispute_rules",
+        help_text="If set, this rule only applies to this specific agreement"
+    )
+
     class Meta:
         verbose_name = "Dispute Rule"
         verbose_name_plural = "Dispute Rules"
         ordering = ["priority", "name"]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["scope", "name"],
-                name="unique_dispute_rule_name_per_scope"
-            )
-        ]
 
     def __str__(self):
         return f"{self.name} (Priority: {self.priority})"
@@ -840,16 +842,20 @@ class CreditRule(TenantModel):
         help_text="MANUAL = create a pending action alert; AUTO = fire immediately"
     )
 
+    # Agreement-level override (null = scope-level, applies to all agreements)
+    agreement = models.ForeignKey(
+        "leases.Agreement",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="credit_rules",
+        help_text="If set, this rule only applies to this specific agreement"
+    )
+
     class Meta:
         verbose_name = "Credit Rule"
         verbose_name_plural = "Credit Rules"
         ordering = ["name"]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["scope", "name"],
-                name="unique_credit_rule_name_per_scope"
-            )
-        ]
 
     def __str__(self):
         role = self.approval_role.name if self.approval_role_id else "No role"
@@ -1145,6 +1151,24 @@ class Invoice(TenantModel):
         default=Decimal("0"),
         validators=[MinValueValidator(Decimal("0"))]
     )
+
+    # GST split breakdown
+    gst_type = models.CharField(
+        max_length=10,
+        choices=[("IGST", "IGST"), ("CGST_SGST", "CGST+SGST")],
+        blank=True,
+        default="",
+    )
+    cgst_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, default=Decimal("0")
+    )
+    sgst_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, default=Decimal("0")
+    )
+    igst_amount = models.DecimalField(
+        max_digits=14, decimal_places=2, default=Decimal("0")
+    )
+
     total_amount = models.DecimalField(
         max_digits=14,
         decimal_places=2,
@@ -1176,6 +1200,16 @@ class Invoice(TenantModel):
 
     # Currency
     currency = models.CharField(max_length=3, default="INR")
+
+    # GST / billing flags
+    is_gst_invoice = models.BooleanField(
+        default=True,
+        help_text="Whether this is a GST invoice (seeded from SiteBillingConfig)"
+    )
+    billing_address = models.TextField(
+        blank=True,
+        help_text="Overridden billing address for this invoice"
+    )
 
     # Notes
     notes = models.TextField(blank=True)

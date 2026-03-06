@@ -215,6 +215,13 @@ class BillingRuleViewSet(InheritableScopedViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
 
+        # Filter by agreement (agreement-specific rules)
+        agreement_id = self.request.query_params.get("agreement")
+        if agreement_id:
+            queryset = queryset.filter(agreement_id=agreement_id)
+        elif self.request.query_params.get("scope_only") == "true":
+            queryset = queryset.filter(agreement__isnull=True)
+
         # Filter by category
         category = self.request.query_params.get("category")
         if category:
@@ -234,6 +241,7 @@ class BillingRuleViewSet(InheritableScopedViewSet):
 
     def perform_create(self, serializer):
         scope = self.get_active_scope()
+        # agreement is passed in the payload; scope is always set from header
         serializer.save(
             scope=scope,
             created_by=self.request.user,
@@ -275,9 +283,17 @@ class BillingRuleViewSet(InheritableScopedViewSet):
             category=original.category,
             applies_to=original.applies_to,
             status=models.BillingRule.RuleStatus.DRAFT,
-            rule_config=original.rule_config,
+            trigger_mode=original.trigger_mode,
+            charge_type=original.charge_type,
+            calculation_method=original.calculation_method,
+            amount=original.amount,
+            rate=original.rate,
+            max_cap_amount=original.max_cap_amount,
+            trigger_event=original.trigger_event,
+            grace_period_days=original.grace_period_days,
+            gl_code=original.gl_code,
             owner=request.user,
-            created_by=request.user
+            created_by=request.user,
         )
 
         serializer = self.get_serializer(cloned)
@@ -318,6 +334,13 @@ class DisputeRuleViewSet(InheritableScopedViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
+
+        # Filter by agreement (agreement-specific rules)
+        agreement_id = self.request.query_params.get("agreement")
+        if agreement_id:
+            queryset = queryset.filter(agreement_id=agreement_id)
+        elif self.request.query_params.get("scope_only") == "true":
+            queryset = queryset.filter(agreement__isnull=True)
 
         # Filter by status
         status_filter = self.request.query_params.get("status")
@@ -414,6 +437,13 @@ class CreditRuleViewSet(InheritableScopedViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
 
+        # Filter by agreement (agreement-specific rules)
+        agreement_id = self.request.query_params.get("agreement")
+        if agreement_id:
+            queryset = queryset.filter(agreement_id=agreement_id)
+        elif self.request.query_params.get("scope_only") == "true":
+            queryset = queryset.filter(agreement__isnull=True)
+
         # Filter by status
         status_filter = self.request.query_params.get("status")
         if status_filter:
@@ -424,10 +454,10 @@ class CreditRuleViewSet(InheritableScopedViewSet):
         if trigger_type:
             queryset = queryset.filter(trigger_type=trigger_type)
 
-        # Filter by approval level
-        approval_level = self.request.query_params.get("approval_level")
-        if approval_level:
-            queryset = queryset.filter(approval_level=approval_level)
+        # Filter by approval role
+        approval_role = self.request.query_params.get("approval_role")
+        if approval_role:
+            queryset = queryset.filter(approval_role_id=approval_role)
 
         return queryset
 
@@ -843,6 +873,7 @@ class InvoiceViewSet(ScopedViewSet):
     - GET /invoices/summary/ - Get invoice summary stats
     """
 
+    rbac_module = "AR"
     queryset = models.Invoice.objects.all()
     serializer_class = serializers.InvoiceSerializer
 
@@ -928,6 +959,19 @@ class InvoiceViewSet(ScopedViewSet):
     def dispute(self, request, pk=None):
         """Mark invoice as disputed."""
         from .engines import RulesEngine
+        scope = self.get_active_scope()
+
+        # Enforce ARGlobalSettings: block if dispute management is disabled
+        try:
+            ar_settings = models.ARGlobalSettings.objects.get(scope=scope)
+            if not ar_settings.enable_dispute_management:
+                return Response(
+                    {"error": "Dispute management is disabled for this scope."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+        except models.ARGlobalSettings.DoesNotExist:
+            ar_settings = None
+
         invoice = self.get_object()
         invoice.is_disputed = True
         invoice.dispute_reason = request.data.get("reason", "")
@@ -935,7 +979,25 @@ class InvoiceViewSet(ScopedViewSet):
         invoice.disputed_by = request.user
         invoice.status = models.Invoice.InvoiceStatus.DISPUTED
         invoice.save()
-        scope = self.get_active_scope()
+
+        # Apply global dispute hold defaults from ARGlobalSettings
+        if ar_settings:
+            try:
+                ar = invoice.agreement.ar_rules
+                if ar_settings.default_dispute_hold_collection:
+                    ar.dispute_hold = True
+                if ar_settings.default_stop_interest_on_dispute:
+                    ar.stop_interest_on_dispute = True
+                if ar_settings.default_stop_reminders_on_dispute:
+                    ar.stop_reminders_on_dispute = True
+                ar.save(update_fields=[
+                    "dispute_hold",
+                    "stop_interest_on_dispute",
+                    "stop_reminders_on_dispute",
+                ])
+            except Exception:
+                pass  # AR rules may not exist yet; don't block dispute
+
         try:
             RulesEngine.check_dispute_rules(invoice, scope, request.user)
         except Exception:
@@ -1259,6 +1321,21 @@ class CreditNoteViewSet(ScopedViewSet):
         from .engines import RulesEngine
         scope = self.get_active_scope()
         credit_note = serializer.save(scope=scope, created_by=self.request.user)
+
+        # Enforce ARGlobalSettings: if credit_note_requires_approval is True,
+        # move the CN to PENDING_APPROVAL unless a credit rule already set a
+        # definitive status (APPROVED / REJECTED / etc.).
+        try:
+            ar_settings = models.ARGlobalSettings.objects.get(scope=scope)
+            if (
+                ar_settings.credit_note_requires_approval
+                and credit_note.status == models.CreditNote.CreditNoteStatus.DRAFT
+            ):
+                credit_note.status = models.CreditNote.CreditNoteStatus.PENDING_APPROVAL
+                credit_note.save(update_fields=["status"])
+        except models.ARGlobalSettings.DoesNotExist:
+            pass
+
         try:
             RulesEngine.check_credit_rules(credit_note, scope, self.request.user)
         except Exception:

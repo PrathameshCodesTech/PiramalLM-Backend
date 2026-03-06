@@ -20,6 +20,7 @@ class TenantCompanyViewSet(ScopedViewSet):
     - GET /companies/leased-summary/ - Summary of tenants with active leases
     """
 
+    rbac_module = "TENANT"
     queryset = models.TenantCompany.objects.all()
     serializer_class = serializers.TenantCompanySerializer
 

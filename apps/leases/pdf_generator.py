@@ -372,7 +372,7 @@ def _get_sections_with_clauses(agreement):
 
     clause_usages = ClauseUsage.objects.filter(
         agreement=agreement, is_active=True
-    ).select_related("clause", "clause_version", "section")
+    ).select_related("clause", "clause_version", "section").order_by("sort_order", "id")
 
     usage_by_section = {}
     for cu in clause_usages:

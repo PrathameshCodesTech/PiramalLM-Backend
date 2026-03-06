@@ -856,7 +856,7 @@ class CAMComponent(TenantModel):
         if self.group_id and self.scope_id and self.group.scope_id != self.scope_id:
             raise ValidationError("CAMComponent scope must match CAMComponentGroup scope.")
 
-    def calculate_charge(self, area_sqft, consumption_kwh=None, consumption_liters=None):
+    def calculate_charge(self, area_sqft, consumption_kwh=None, consumption_liters=None, unit_count=None):
         """
         Calculate the charge for this component based on area and consumption.
 
@@ -883,6 +883,9 @@ class CAMComponent(TenantModel):
         elif self.rate_logic == self.RateLogic.SHARE_OF_TOTAL:
             # Requires total pool calculation - handled at site level
             base_charge = self.default_rate
+        elif self.rate_logic == self.RateLogic.PER_UNIT:
+            units = Decimal(str(unit_count if unit_count and unit_count > 0 else 1))
+            base_charge = self.default_rate * units
 
         gst_amount = base_charge * (self.gst_rate / 100)
         total_charge = base_charge + gst_amount
@@ -999,7 +1002,7 @@ class SiteCAMConfig(TenantModel):
             return self.gl_code_override
         return self.component.gl_code
 
-    def calculate_charge(self, area_sqft, consumption_kwh=None, consumption_liters=None):
+    def calculate_charge(self, area_sqft, consumption_kwh=None, consumption_liters=None, unit_count=None):
         """
         Calculate the charge using site-specific rates.
         """
@@ -1019,6 +1022,9 @@ class SiteCAMConfig(TenantModel):
             base_charge = rate / 12
         elif self.component.rate_logic == CAMComponent.RateLogic.SHARE_OF_TOTAL:
             base_charge = rate
+        elif self.component.rate_logic == CAMComponent.RateLogic.PER_UNIT:
+            units = Decimal(str(unit_count if unit_count and unit_count > 0 else 1))
+            base_charge = rate * units
 
         gst_amount = base_charge * (gst_rate / 100)
         total_charge = base_charge + gst_amount

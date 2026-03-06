@@ -372,6 +372,14 @@ class Agreement(TenantModel):
         blank=True,
         related_name="agreements",
     )
+    clause_mapping_draft = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Draft clause-to-section mapping for this agreement. "
+            "Used to auto-sync ClauseUsage records when the agreement is submitted."
+        ),
+    )
 
     class Meta:
         verbose_name = "Lease Agreement"
@@ -393,6 +401,85 @@ class Agreement(TenantModel):
             raise ValidationError("Agreement scope must match tenant scope.")
         if self.site_id and self.scope_id and self.site.scope_id != self.scope_id:
             raise ValidationError("Agreement scope must match site scope.")
+
+
+class AgreementApproval(TenantModel):
+    """
+    Approval workflow steps for lease agreements.
+    """
+
+    class ApprovalStepStatus(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        APPROVED = "APPROVED", "Approved"
+        REJECTED = "REJECTED", "Rejected"
+        SKIPPED = "SKIPPED", "Skipped"
+
+    agreement = models.ForeignKey(
+        Agreement,
+        on_delete=models.CASCADE,
+        related_name="approval_steps",
+    )
+    step_order = models.PositiveIntegerField(
+        default=1,
+        help_text="Order of this approval step",
+    )
+    step_name = models.CharField(
+        max_length=100,
+        help_text="Name of approval step (e.g., L1 - Finance Manager)",
+    )
+    step_description = models.TextField(
+        blank=True,
+        help_text="Description of what this step entails",
+    )
+    approval_required = models.BooleanField(
+        default=True,
+        help_text="If False, this is informational and does not block activation",
+    )
+    approver = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="agreement_approvals",
+    )
+    approver_role = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Role required for approval",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=ApprovalStepStatus.choices,
+        default=ApprovalStepStatus.PENDING,
+    )
+    actioned_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When action was taken",
+    )
+    comments = models.TextField(
+        blank=True,
+        help_text="Approver comments",
+    )
+    due_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Deadline for this approval step",
+    )
+
+    class Meta:
+        verbose_name = "Agreement Approval"
+        verbose_name_plural = "Agreement Approvals"
+        ordering = ["agreement", "step_order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["agreement", "step_order"],
+                name="unique_agreement_approval_step",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.step_name} - {self.agreement.lease_id}"
 
 
 class LeaseTermDates(TenantModel):
@@ -2046,6 +2133,19 @@ class LeaseAmendment(TenantModel):
     #     {"field": "Base Rent", "previous": "₹1,00,000", "new": "₹1,05,000"},
     #     {"field": "CAM Rate", "previous": "₹25/sqft", "new": "₹27/sqft"}
     # ]
+
+    # Structured change data — used by execute() to mutate agreement fields
+    amendment_data = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Machine-readable changes to apply on execute. "
+            "RENT_REVISION: {base_rent_monthly}. "
+            "TERM_EXTENSION/RENEWAL: {expiry_date, initial_term_months}. "
+            "EARLY_TERMINATION: {termination_date}. "
+            "PARTY_CHANGE: {new_tenant_id}."
+        ),
+    )
 
     # Full Description
     description = models.TextField(

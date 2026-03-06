@@ -4,6 +4,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.viewsets import ModelViewSet
 
 from apps.core.utils import get_active_scope
+from apps.core.permissions import RBACPermission
 
 
 class ScopedViewSet(ModelViewSet):
@@ -15,9 +16,17 @@ class ScopedViewSet(ModelViewSet):
     - get_queryset(): Returns objects in user's scope + all child scopes
     - perform_create(): Uses X-Scope-ID header for scope assignment
     - Supports explicit scope in payload (for scope picker)
+
+    RBAC:
+    - Set `rbac_module` on a subclass to enable module-level permission checks.
+    - If not set, all authenticated + scoped requests are allowed (backwards compatible).
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, RBACPermission]
+
+    # Set to a ModulePermission.Module value to enable RBAC for this ViewSet.
+    # e.g. rbac_module = "LEASE"
+    rbac_module = None
 
     # Set to True to enable hierarchy-aware filtering (ORG sees COMPANY/ENTITY data)
     # Set to False for exact scope matching only

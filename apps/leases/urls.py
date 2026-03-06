@@ -13,6 +13,7 @@ router.register(r"agreement-sections", views.AgreementSectionViewSet, basename="
 
 # Core lease endpoints
 router.register(r"agreements", views.AgreementViewSet, basename="agreement")
+router.register(r"agreement-approvals", views.AgreementApprovalViewSet, basename="agreement-approval")
 router.register(r"allocations", views.UnitAllocationViewSet, basename="allocation")
 router.register(r"documents", views.DocumentViewSet, basename="document")
 router.register(r"notes", views.NoteViewSet, basename="note")

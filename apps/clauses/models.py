@@ -52,6 +52,15 @@ class Clause(TenantModel):
         ARCHIVED = "ARCHIVED", "Archived"
         INACTIVE = "INACTIVE", "Inactive"
 
+    class ClauseType(models.TextChoices):
+        TERMINATION = "TERMINATION", "Termination & Early Exit"
+        RENEWAL = "RENEWAL", "Renewal Option"
+        SUBLETTING = "SUBLETTING", "Subletting & Signage"
+        EXCLUSIVITY = "EXCLUSIVITY", "Exclusivity & Non-Compete"
+        INSURANCE = "INSURANCE", "Insurance & Reinstatement"
+        DISPUTE = "DISPUTE", "Dispute Resolution"
+        GENERAL = "GENERAL", "General"
+
     # Identification
     clause_id = models.CharField(
         max_length=50,
@@ -74,6 +83,12 @@ class Clause(TenantModel):
         max_length=20,
         choices=Status.choices,
         default=Status.DRAFT
+    )
+    clause_type = models.CharField(
+        max_length=20,
+        choices=ClauseType.choices,
+        default=ClauseType.GENERAL,
+        help_text="Which Legal Config model this clause seeds when attached to an agreement",
     )
 
     # Current version tracking
@@ -310,6 +325,12 @@ class ClauseUsage(TenantModel):
         help_text="Section within agreement structure where this clause appears",
     )
 
+    # Whether this clause is active for this agreement
+    active = models.BooleanField(
+        default=True,
+        help_text="Whether this clause applies to this agreement",
+    )
+
     # Override config for this specific usage
     custom_config = models.JSONField(
         default=dict,
@@ -320,10 +341,15 @@ class ClauseUsage(TenantModel):
         blank=True,
         help_text="Custom body text for this agreement"
     )
+    sort_order = models.PositiveIntegerField(
+        default=0,
+        help_text="Display order of this clause within its section"
+    )
 
     class Meta:
         verbose_name = "Clause Usage"
         verbose_name_plural = "Clause Usages"
+        ordering = ["sort_order", "id"]
         constraints = [
             models.UniqueConstraint(
                 fields=["clause", "agreement"],
@@ -333,3 +359,60 @@ class ClauseUsage(TenantModel):
 
     def __str__(self):
         return f"{self.clause.title} in {self.agreement.lease_id}"
+
+    # ── Master + override helpers ─────────────────────────────────────────────
+
+    def get_master_config(self):
+        """Return config from the pinned ClauseVersion, or fall back to current."""
+        version = self.clause_version
+        if not version:
+            try:
+                version = self.clause.versions.filter(
+                    version_status=ClauseVersion.VersionStatus.CURRENT
+                ).first()
+            except Exception:
+                return {}
+        return (version.config or {}) if version else {}
+
+    def get_merged_config(self):
+        """Master defaults merged with agreement-level overrides."""
+        merged = dict(self.get_master_config())
+        merged.update(self.custom_config or {})
+        return merged
+
+    def apply_to_agreement(self):
+        """Write merged config into the corresponding Legal Config model.
+
+        Called automatically after create/update so the Legal Config tab
+        always reflects the clause's effective values.
+        """
+        from apps.leases import models as lease_models  # local import avoids circularity
+
+        clause_type = self.clause.clause_type
+        if clause_type == Clause.ClauseType.GENERAL or not self.active:
+            return
+
+        type_to_model = {
+            Clause.ClauseType.TERMINATION: lease_models.LeaseTermination,
+            Clause.ClauseType.RENEWAL:     lease_models.LeaseRenewalOption,
+            Clause.ClauseType.SUBLETTING:  lease_models.LeaseSubletSignage,
+            Clause.ClauseType.EXCLUSIVITY: lease_models.LeaseExclusivity,
+            Clause.ClauseType.INSURANCE:   lease_models.LeaseInsuranceRequirement,
+            Clause.ClauseType.DISPUTE:     lease_models.LeaseDisputeResolution,
+        }
+        model_class = type_to_model.get(clause_type)
+        if not model_class:
+            return
+
+        merged = self.get_merged_config()
+        if not merged:
+            return
+
+        instance, _ = model_class.objects.get_or_create(
+            agreement=self.agreement,
+            defaults={"scope": self.agreement.scope},
+        )
+        for field_name, value in merged.items():
+            if value is not None and hasattr(instance, field_name):
+                setattr(instance, field_name, value)
+        instance.save()

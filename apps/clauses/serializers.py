@@ -95,19 +95,29 @@ class ClauseListSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source="category.name", read_only=True)
     version_label = serializers.ReadOnlyField()
     owner_name = serializers.SerializerMethodField()
+    current_version_config = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Clause
         fields = (
             "id", "clause_id", "title", "category", "category_name",
-            "applies_to", "status", "version_label",
-            "owner", "owner_name", "updated_at"
+            "applies_to", "clause_type", "status", "version_label",
+            "owner", "owner_name", "updated_at", "current_version_config",
         )
 
     def get_owner_name(self, obj):
         if obj.owner:
             return obj.owner.get_full_name() or obj.owner.email
         return None
+
+    def get_current_version_config(self, obj):
+        try:
+            for v in obj.versions.all():
+                if v.version_status == models.ClauseVersion.VersionStatus.CURRENT:
+                    return v.config or {}
+        except Exception:
+            pass
+        return {}
 
 
 class ClauseSerializer(serializers.ModelSerializer):
@@ -182,8 +192,8 @@ class ClauseCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Clause
         fields = (
-            "title", "category", "applies_to", "status",
-            "initial_change_summary", "initial_body_text", "initial_config"
+            "title", "category", "applies_to", "clause_type", "status",
+            "initial_change_summary", "initial_body_text", "initial_config",
         )
 
     def create(self, validated_data):
@@ -336,15 +346,25 @@ class ClauseDocumentLinkCreateSerializer(serializers.ModelSerializer):
 class ClauseUsageSerializer(serializers.ModelSerializer):
     clause_title = serializers.CharField(source="clause.title", read_only=True)
     clause_id_display = serializers.CharField(source="clause.clause_id", read_only=True)
+    clause_type = serializers.CharField(source="clause.clause_type", read_only=True)
     agreement_lease_id = serializers.CharField(source="agreement.lease_id", read_only=True)
     version_label = serializers.SerializerMethodField()
+    master_config = serializers.SerializerMethodField()
+    merged_config = serializers.SerializerMethodField()
 
     class Meta:
         model = models.ClauseUsage
-        fields = "__all__"
+        fields = (
+            "id", "clause", "clause_title", "clause_id_display", "clause_type",
+            "clause_version", "agreement", "agreement_lease_id", "section",
+            "active", "custom_config", "custom_body_text", "sort_order",
+            "master_config", "merged_config", "version_label",
+            "scope", "created_at", "updated_at",
+        )
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
-            "created_by", "updated_by", "is_active", "deleted_at"
+            "clause_title", "clause_id_display", "clause_type",
+            "agreement_lease_id", "version_label", "master_config", "merged_config",
         )
 
     def get_version_label(self, obj):
@@ -352,10 +372,19 @@ class ClauseUsageSerializer(serializers.ModelSerializer):
             return obj.clause_version.version_label
         return None
 
+    def get_master_config(self, obj):
+        return obj.get_master_config()
+
+    def get_merged_config(self, obj):
+        return obj.get_merged_config()
+
 
 class ClauseUsageCreateSerializer(serializers.ModelSerializer):
     """Serializer for attaching a clause to an agreement."""
 
     class Meta:
         model = models.ClauseUsage
-        fields = ("clause", "clause_version", "agreement", "section", "custom_config", "custom_body_text")
+        fields = (
+            "clause", "clause_version", "agreement", "section",
+            "active", "custom_config", "custom_body_text", "sort_order",
+        )

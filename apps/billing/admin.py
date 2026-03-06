@@ -150,8 +150,6 @@ class SiteBillingConfigAdmin(admin.ModelAdmin):
         ("Payment Terms", {
             "fields": (
                 "default_payment_term", "grace_period_days",
-                "early_payment_discount_percent", "early_payment_discount_days",
-                "late_fee_percent", "late_fee_flat_amount", "interest_rate_annual"
             )
         }),
         ("Tax Settings", {

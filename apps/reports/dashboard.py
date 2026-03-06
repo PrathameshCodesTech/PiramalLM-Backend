@@ -117,11 +117,58 @@ class DashboardService:
     def _get_base_agreement_filter(self):
         """Get base Q filter for agreements based on scope and filters."""
         filters = Q(is_active=True, scope_id__in=self.scope_ids)
-        
+
         if self.site_ids:
             filters &= Q(site_id__in=self.site_ids)
-        
+
         return filters
+
+    def _get_leased_area_at(self, as_of_date):
+        """Return total allocated sqft that was active on a given date (used for period comparison)."""
+        allocs = self._apply_scope_filter(
+            UnitAllocation.objects.filter(
+                is_active=True,
+                agreement__term_dates__commencement_date__lte=as_of_date,
+                agreement__term_dates__expiry_date__gte=as_of_date,
+            )
+        )
+        if self.site_ids:
+            allocs = allocs.filter(agreement__site_id__in=self.site_ids)
+        return float(allocs.aggregate(
+            total=Coalesce(Sum('allocated_area_sqft'), Value(0, output_field=DecimalField()))
+        )['total'])
+
+    def _get_period_collection_pct(self, date_from, date_to):
+        """Return (total_collected, collection_pct) for a given date range."""
+        payments = self._apply_scope_filter(
+            Payment.objects.filter(
+                is_active=True,
+                status=Payment.PaymentStatus.CONFIRMED,
+                payment_date__gte=date_from,
+                payment_date__lte=date_to,
+            )
+        )
+        if self.site_ids:
+            payments = payments.filter(invoice__agreement__site_id__in=self.site_ids)
+        collected = float(payments.aggregate(
+            total=Coalesce(Sum('amount'), Value(0, output_field=DecimalField()))
+        )['total'])
+
+        invoices = self._apply_scope_filter(
+            Invoice.objects.filter(
+                is_active=True,
+                invoice_date__gte=date_from,
+                invoice_date__lte=date_to,
+            )
+        )
+        if self.site_ids:
+            invoices = invoices.filter(agreement__site_id__in=self.site_ids)
+        raised = float(invoices.aggregate(
+            total=Coalesce(Sum('total_amount'), Value(0, output_field=DecimalField()))
+        )['total'])
+
+        pct = round((collected / raised) * 100, 1) if raised > 0 else 0.0
+        return collected, pct
 
     def get_full_dashboard(self):
         """
@@ -204,7 +251,15 @@ class DashboardService:
         occupancy_rate = 0
         if total_leasable and total_leasable > 0:
             occupancy_rate = round((float(leased_area) / float(total_leasable)) * 100, 2)
-        
+
+        # Compute change vs 30 days ago
+        prev_as_of = today - timedelta(days=30)
+        prev_leased_area = self._get_leased_area_at(prev_as_of)
+        prev_occupancy_rate = 0.0
+        if total_leasable and total_leasable > 0:
+            prev_occupancy_rate = round((prev_leased_area / float(total_leasable)) * 100, 2)
+        occupancy_change = round(occupancy_rate - prev_occupancy_rate, 1)
+
         # Get breakdown by site
         site_breakdown = []
         sites = Site.objects.filter(self._get_base_site_filter())
@@ -243,14 +298,14 @@ class DashboardService:
         return {
             'value': occupancy_rate,
             'formatted': f"{occupancy_rate}%",
-            'change': 2.3,  # TODO: Calculate vs previous period
+            'change': occupancy_change,
             'change_label': 'vs last month',
             'breakdown': site_breakdown,
             'comparison': {
                 'current': f"{occupancy_rate}%",
-                'previous': f"{max(0, occupancy_rate - 2.3)}%",
+                'previous': f"{prev_occupancy_rate}%",
                 'current_label': 'Portfolio occupancy (current period)',
-                'previous_label': 'Portfolio occupancy (previous period)',
+                'previous_label': 'Portfolio occupancy (30 days ago)',
             },
             'insights': [
                 f"Portfolio occupancy: {occupancy_rate}% ({int(leased_area):,} / {int(total_leasable):,} sqft leased)",
@@ -298,7 +353,13 @@ class DashboardService:
         )['total']
         
         vacant_area = float(total_leasable or 0) - float(leased_area or 0)
-        
+
+        # Compute change vs 30 days ago
+        prev_as_of = today - timedelta(days=30)
+        prev_leased_area = self._get_leased_area_at(prev_as_of)
+        prev_vacant_area = float(total_leasable or 0) - prev_leased_area
+        vacant_change = round(vacant_area - prev_vacant_area)
+
         # Get breakdown by site
         site_breakdown = []
         sites = Site.objects.filter(self._get_base_site_filter())
@@ -331,14 +392,14 @@ class DashboardService:
         return {
             'value': vacant_area,
             'formatted': f"{int(vacant_area):,} sqft",
-            'change': -5200,  # TODO: Calculate vs previous period
-            'change_label': 'sqft',
+            'change': vacant_change,
+            'change_label': 'sqft vs last month',
             'breakdown': site_breakdown,
             'comparison': {
                 'current': f"{int(vacant_area):,} sqft",
-                'previous': f"{int(vacant_area + 5200):,} sqft",
+                'previous': f"{int(prev_vacant_area):,} sqft",
                 'current_label': 'Total vacant area (current period)',
-                'previous_label': 'Total vacant area (previous period)',
+                'previous_label': 'Total vacant area (30 days ago)',
             },
             'insights': [
                 f"Total vacant: {int(vacant_area):,} sqft across {sites.count()} properties",
@@ -391,7 +452,24 @@ class DashboardService:
         collection_pct = 0
         if total_raised and total_raised > 0:
             collection_pct = round((float(total_collected) / float(total_raised)) * 100, 1)
-        
+
+        # Compute change vs prior equivalent period
+        today = self.as_of
+        if self.date_from and self.date_to:
+            period_days = max((self.date_to - self.date_from).days, 1)
+            prev_date_from = self.date_from - timedelta(days=period_days)
+            prev_date_to = self.date_to - timedelta(days=period_days)
+            change_label = 'vs prev period'
+        else:
+            # Default: current month vs previous month
+            month_start = today.replace(day=1)
+            prev_month_end = month_start - timedelta(days=1)
+            prev_date_from = prev_month_end.replace(day=1)
+            prev_date_to = prev_month_end
+            change_label = 'vs last month'
+        prev_total_collected, prev_collection_pct = self._get_period_collection_pct(prev_date_from, prev_date_to)
+        collection_change = round(collection_pct - prev_collection_pct, 1)
+
         # Get breakdown by site
         site_breakdown = []
         sites = Site.objects.filter(self._get_base_site_filter())
@@ -421,13 +499,13 @@ class DashboardService:
         return {
             'value': float(total_collected or 0),
             'formatted': f"₹{self._format_money(total_collected)}",
-            'change': -8.1,  # TODO: Calculate vs target
-            'change_label': 'vs target',
+            'change': collection_change,
+            'change_label': change_label,
             'collection_percentage': collection_pct,
             'breakdown': site_breakdown,
             'comparison': {
                 'current': f"₹{self._format_money(total_collected)}",
-                'previous': f"₹{self._format_money(float(total_collected or 0) * 0.95)}",
+                'previous': f"₹{self._format_money(prev_total_collected)}",
                 'current_label': 'Rent collected (current period)',
                 'previous_label': 'Rent collected (previous period)',
             },
