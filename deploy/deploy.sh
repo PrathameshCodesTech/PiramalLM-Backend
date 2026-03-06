@@ -7,12 +7,10 @@ set -e
 BASE="/var/www/piramallease"
 
 echo "=== Pulling Backend ==="
-cd $BASE/Backend
-git pull
+cd $BASE/Backend && git pull
 
 echo "=== Pulling Frontend ==="
-cd $BASE/new-frontend
-git pull
+cd $BASE/new-frontend && git pull
 
 echo "=== Python packages ==="
 $BASE/venv/bin/pip install -r $BASE/Backend/requirements.txt
