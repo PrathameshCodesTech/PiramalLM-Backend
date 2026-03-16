@@ -380,6 +380,27 @@ class ClauseUsage(TenantModel):
         merged.update(self.custom_config or {})
         return merged
 
+    def _clear_derived_lease_record(self):
+        """Delete the corresponding typed lease record when this usage is removed or inactivated."""
+        from apps.leases import models as lease_models
+
+        clause_type = self.clause.clause_type
+        if clause_type == Clause.ClauseType.GENERAL:
+            return
+
+        type_to_model = {
+            Clause.ClauseType.TERMINATION: lease_models.LeaseTermination,
+            Clause.ClauseType.RENEWAL:     lease_models.LeaseRenewalOption,
+            Clause.ClauseType.SUBLETTING:  lease_models.LeaseSubletSignage,
+            Clause.ClauseType.EXCLUSIVITY: lease_models.LeaseExclusivity,
+            Clause.ClauseType.INSURANCE:   lease_models.LeaseInsuranceRequirement,
+            Clause.ClauseType.DISPUTE:     lease_models.LeaseDisputeResolution,
+        }
+        model_class = type_to_model.get(clause_type)
+        if not model_class:
+            return
+        model_class.objects.filter(agreement=self.agreement).delete()
+
     def apply_to_agreement(self):
         """Write merged config into the corresponding Legal Config model.
 

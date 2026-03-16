@@ -4,21 +4,69 @@ from . import models
 
 # ===================== Ageing Bucket Serializers =====================
 
+_AGEING_BUCKET_EXCLUDE = ("include_in_dso",)
+
+
 class AgeingBucketSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.AgeingBucket
-        fields = "__all__"
+        exclude = _AGEING_BUCKET_EXCLUDE
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+
+    def validate(self, attrs):
+        """Enforce maximum 4 active buckets per scope (ARSummary has 4 fixed columns)."""
+        from apps.accounts.models import TenantScope
+
+        new_status = attrs.get("status")
+
+        if self.instance is None:
+            # Create: default status is ACTIVE
+            effective_status = new_status if new_status is not None else "ACTIVE"
+        else:
+            # Update: only check if status is being explicitly changed TO ACTIVE
+            # from a non-ACTIVE state (reactivation)
+            if new_status is None or new_status == self.instance.status:
+                return attrs
+            effective_status = new_status
+
+        if effective_status != "ACTIVE":
+            return attrs
+
+        request = self.context.get("request")
+        if not request:
+            return attrs
+
+        scope_id = request.headers.get("X-Scope-ID")
+        if not scope_id:
+            return attrs
+
+        try:
+            scope = TenantScope.objects.get(id=scope_id)
+        except TenantScope.DoesNotExist:
+            return attrs
+
+        active_qs = models.AgeingBucket.objects.filter(scope=scope, status="ACTIVE")
+        if self.instance:
+            active_qs = active_qs.exclude(pk=self.instance.pk)
+
+        if active_qs.count() >= 4:
+            raise serializers.ValidationError(
+                "Maximum 4 active ageing buckets are supported "
+                "(ARSummary has 4 fixed columns). "
+                "Deactivate an existing bucket before adding a new one."
+            )
+
+        return attrs
 
 
 class AgeingBucketListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for list views."""
     class Meta:
         model = models.AgeingBucket
-        fields = ("id", "label", "from_days", "to_days", "sort_order", "color_code")
+        fields = ("id", "label", "from_days", "to_days", "sort_order", "color_code", "status")
 
 
 # ===================== AR Rule Serializers =====================
@@ -42,6 +90,96 @@ class ARRuleUpdateSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+
+
+class ARRuleInputSerializer(serializers.Serializer):
+    """
+    Write-only serializer for the AR policy payload accepted at agreement
+    creation time.  All fields are optional — omitted fields fall back to
+    the ARRule model defaults or ARGlobalSettings seed values.
+    """
+    dispute_hold = serializers.BooleanField(required=False)
+    stop_interest_on_dispute = serializers.BooleanField(required=False)
+    stop_reminders_on_dispute = serializers.BooleanField(required=False)
+    credit_note_allowed = serializers.BooleanField(required=False)
+    credit_note_requires_approval = serializers.BooleanField(required=False)
+    max_credit_note_percent = serializers.DecimalField(
+        max_digits=5, decimal_places=2, required=False, allow_null=True
+    )
+    auto_reminder_enabled = serializers.BooleanField(required=False)
+    reminder_days_before_due = serializers.IntegerField(required=False, min_value=0)
+    reminder_days_after_due = serializers.IntegerField(required=False, min_value=0)
+    escalation_days = serializers.IntegerField(required=False, min_value=0)
+
+
+class BillingRuleAttachOverrideSerializer(serializers.Serializer):
+    """
+    Optional override fields accepted at agreement-create time alongside
+    selected_billing_rule_id.  All fields are optional — omitted fields keep
+    the copied template value.
+    """
+    name = serializers.CharField(required=False, max_length=100)
+    charge_type = serializers.ChoiceField(
+        choices=models.BillingRule.ChargeType.choices, required=False
+    )
+    calculation_method = serializers.ChoiceField(
+        choices=models.BillingRule.CalculationMethod.choices, required=False
+    )
+    rate = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    max_cap_amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, required=False, allow_null=True
+    )
+    grace_period_days = serializers.IntegerField(required=False, min_value=0)
+    trigger_mode = serializers.ChoiceField(
+        choices=models.BillingRule.TriggerMode.choices, required=False
+    )
+
+
+class DisputeRuleAttachOverrideSerializer(serializers.Serializer):
+    """
+    Optional override fields accepted alongside selected_dispute_rule_id.
+    """
+    name = serializers.CharField(required=False, max_length=100)
+    condition_type = serializers.ChoiceField(
+        choices=models.DisputeRule.ConditionType.choices, required=False
+    )
+    operator = serializers.ChoiceField(
+        choices=models.DisputeRule.Operator.choices, required=False
+    )
+    threshold_value = serializers.DecimalField(
+        max_digits=14, decimal_places=2, required=False
+    )
+    action_description = serializers.CharField(required=False, max_length=200)
+    route_to_role = serializers.CharField(
+        required=False, allow_blank=True, allow_null=True, max_length=100
+    )
+    trigger_mode = serializers.ChoiceField(
+        choices=models.DisputeRule.TriggerMode.choices, required=False
+    )
+
+
+class CreditRuleAttachOverrideSerializer(serializers.Serializer):
+    """
+    Optional override fields accepted alongside selected_credit_rule_id.
+    """
+    name = serializers.CharField(required=False, max_length=100)
+    trigger_type = serializers.ChoiceField(
+        choices=models.CreditRule.TriggerType.choices, required=False
+    )
+    variance_threshold = serializers.DecimalField(
+        max_digits=14, decimal_places=2, required=False, allow_null=True
+    )
+    variance_basis = serializers.ChoiceField(
+        choices=models.CreditRule.VarianceBasis.choices, required=False
+    )
+    max_credit_amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, required=False, allow_null=True
+    )
+    auto_approve = serializers.BooleanField(required=False)
+    trigger_mode = serializers.ChoiceField(
+        choices=models.CreditRule.TriggerMode.choices, required=False
+    )
 
 
 # ===================== Invoice Line Item Serializers =====================
@@ -550,11 +688,20 @@ class TenantLeasesRulesSerializer(serializers.Serializer):
 # AGEING CONFIG SERIALIZERS (Tab 4 - Ageing Logic)
 # =============================================================================
 
+_AGEING_CONFIG_EXCLUDE = (
+    "currency_handling",
+    "exclude_credit_blocked_customers",
+    "show_on_ar_dashboard",
+    "show_in_customer_statements",
+    "enable_separate_disputed_ageing",
+)
+
+
 class AgeingConfigSerializer(serializers.ModelSerializer):
     """Full serializer for ageing configuration."""
     class Meta:
         model = models.AgeingConfig
-        fields = "__all__"
+        exclude = _AGEING_CONFIG_EXCLUDE
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
@@ -565,7 +712,7 @@ class AgeingConfigUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating ageing config (scope is read-only)."""
     class Meta:
         model = models.AgeingConfig
-        exclude = ("scope",)
+        exclude = ("scope",) + _AGEING_CONFIG_EXCLUDE
         read_only_fields = (
             "id", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
@@ -663,7 +810,6 @@ class SiteBillingConfigCreateSerializer(serializers.ModelSerializer):
 
 class BillingRuleListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for list views."""
-    owner_name = serializers.SerializerMethodField()
     amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
     rate = serializers.DecimalField(max_digits=7, decimal_places=4, read_only=True)
     grace_period_days = serializers.IntegerField(read_only=True)
@@ -671,52 +817,34 @@ class BillingRuleListSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.BillingRule
         fields = (
-            "id", "rule_id", "name", "category", "applies_to",
+            "id", "rule_id", "name",
             "charge_type", "calculation_method", "amount", "rate",
-            "grace_period_days", "trigger_event",
-            "status", "owner_name", "created_at", "agreement"
+            "grace_period_days",
+            "status", "created_at", "agreement",
         )
-
-    def get_owner_name(self, obj):
-        if obj.owner:
-            return obj.owner.get_full_name() or obj.owner.email
-        return None
 
 
 class BillingRuleSerializer(serializers.ModelSerializer):
     """Full serializer for billing rules."""
     class Meta:
         model = models.BillingRule
-        fields = "__all__"
+        exclude = ("category", "applies_to", "gl_code", "owner")
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at",
-            "rule_id"  # Auto-generated
+            "rule_id",
         )
 
 
 class BillingRuleDetailSerializer(serializers.ModelSerializer):
-    """Detail serializer with owner info."""
-    owner_name = serializers.SerializerMethodField()
-    owner_email = serializers.SerializerMethodField()
-
+    """Detail serializer for billing rules."""
     class Meta:
         model = models.BillingRule
-        fields = "__all__"
+        exclude = ("category", "applies_to", "gl_code", "owner")
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
-            "created_by", "updated_by", "is_active", "deleted_at"
+            "created_by", "updated_by", "is_active", "deleted_at",
         )
-
-    def get_owner_name(self, obj):
-        if obj.owner:
-            return obj.owner.get_full_name() or obj.owner.email
-        return None
-
-    def get_owner_email(self, obj):
-        if obj.owner:
-            return obj.owner.email
-        return None
 
 
 # =============================================================================
@@ -745,34 +873,34 @@ class DisputeRuleListSerializer(serializers.ModelSerializer):
         return f"{obj.get_condition_type_display()} {op} {obj.threshold_value}"
 
 
+_DISPUTE_EXCLUDE = (
+    "threshold_currency", "time_window_days", "route_to_user",
+    "auto_resolve", "auto_resolve_action", "require_approval", "flag_customer",
+)
+
+
 class DisputeRuleSerializer(serializers.ModelSerializer):
     """Full serializer for dispute rules."""
     class Meta:
         model = models.DisputeRule
-        fields = "__all__"
+        exclude = _DISPUTE_EXCLUDE
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
-            "created_by", "updated_by", "is_active", "deleted_at"
+            "created_by", "updated_by", "is_active", "deleted_at",
         )
 
 
 class DisputeRuleDetailSerializer(serializers.ModelSerializer):
-    """Detail serializer with route info."""
-    route_to_user_name = serializers.SerializerMethodField()
+    """Detail serializer for dispute rules."""
     condition_display = serializers.SerializerMethodField()
 
     class Meta:
         model = models.DisputeRule
-        fields = "__all__"
+        exclude = _DISPUTE_EXCLUDE
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
-            "created_by", "updated_by", "is_active", "deleted_at"
+            "created_by", "updated_by", "is_active", "deleted_at",
         )
-
-    def get_route_to_user_name(self, obj):
-        if obj.route_to_user:
-            return obj.route_to_user.get_full_name() or obj.route_to_user.email
-        return None
 
     def get_condition_display(self, obj):
         op_map = {
@@ -800,13 +928,16 @@ class CreditRuleListSerializer(serializers.ModelSerializer):
         )
 
 
+_CREDIT_EXCLUDE = ("auto_post_to_gl", "requires_documentation")
+
+
 class CreditRuleSerializer(serializers.ModelSerializer):
     """Full serializer for credit rules."""
     approval_role_name = serializers.CharField(source="approval_role.name", read_only=True, default=None)
 
     class Meta:
         model = models.CreditRule
-        fields = "__all__"
+        exclude = _CREDIT_EXCLUDE
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at",
@@ -815,13 +946,13 @@ class CreditRuleSerializer(serializers.ModelSerializer):
 
 
 class CreditRuleDetailSerializer(serializers.ModelSerializer):
-    """Detail serializer with trigger display."""
+    """Detail serializer for credit rules."""
     trigger_display = serializers.SerializerMethodField()
     approval_role_name = serializers.CharField(source="approval_role.name", read_only=True, default=None)
 
     class Meta:
         model = models.CreditRule
-        fields = "__all__"
+        exclude = _CREDIT_EXCLUDE
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at",
@@ -840,11 +971,21 @@ class CreditRuleDetailSerializer(serializers.ModelSerializer):
 # AR GLOBAL SETTINGS SERIALIZERS (Tab 5 - Toggle Switches)
 # =============================================================================
 
+_AR_GLOBAL_EXCLUDE = (
+    "enable_credit_note_workflow",
+    "max_auto_credit_percent",
+    "revenue_recognition_rule",
+    "ar_ageing_bucket",
+    "eligible_for_dunning",
+    "include_in_auto_email_batch",
+)
+
+
 class ARGlobalSettingsSerializer(serializers.ModelSerializer):
     """Full serializer for AR global settings."""
     class Meta:
         model = models.ARGlobalSettings
-        fields = "__all__"
+        exclude = _AR_GLOBAL_EXCLUDE
         read_only_fields = (
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
@@ -855,7 +996,7 @@ class ARGlobalSettingsUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating AR settings (scope is read-only)."""
     class Meta:
         model = models.ARGlobalSettings
-        exclude = ("scope",)
+        exclude = ("scope",) + _AR_GLOBAL_EXCLUDE
         read_only_fields = (
             "id", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"

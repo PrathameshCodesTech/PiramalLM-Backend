@@ -378,6 +378,33 @@ class ClauseUsageSerializer(serializers.ModelSerializer):
     def get_merged_config(self, obj):
         return obj.get_merged_config()
 
+    def validate(self, attrs):
+        instance = self.instance
+        clause = attrs.get("clause", instance.clause if instance else None)
+        agreement = attrs.get("agreement", instance.agreement if instance else None)
+        active = attrs.get("active", instance.active if instance else True)
+
+        if clause and agreement and active:
+            clause_type = clause.clause_type
+            if clause_type != models.Clause.ClauseType.GENERAL:
+                qs = models.ClauseUsage.objects.filter(
+                    agreement=agreement,
+                    clause__clause_type=clause_type,
+                    active=True,
+                )
+                if instance:
+                    qs = qs.exclude(pk=instance.pk)
+                if qs.exists():
+                    raise serializers.ValidationError(
+                        {
+                            "clause": (
+                                f"An active {clause_type} clause is already attached to this agreement. "
+                                "Remove or deactivate it before adding another."
+                            )
+                        }
+                    )
+        return attrs
+
 
 class ClauseUsageCreateSerializer(serializers.ModelSerializer):
     """Serializer for attaching a clause to an agreement."""
@@ -388,3 +415,27 @@ class ClauseUsageCreateSerializer(serializers.ModelSerializer):
             "clause", "clause_version", "agreement", "section",
             "active", "custom_config", "custom_body_text", "sort_order",
         )
+
+    def validate(self, attrs):
+        clause = attrs.get("clause")
+        agreement = attrs.get("agreement")
+        active = attrs.get("active", True)
+
+        if clause and agreement and active:
+            clause_type = clause.clause_type
+            if clause_type != models.Clause.ClauseType.GENERAL:
+                conflict = models.ClauseUsage.objects.filter(
+                    agreement=agreement,
+                    clause__clause_type=clause_type,
+                    active=True,
+                ).exists()
+                if conflict:
+                    raise serializers.ValidationError(
+                        {
+                            "clause": (
+                                f"An active {clause_type} clause is already attached to this agreement. "
+                                "Remove or deactivate it before adding another."
+                            )
+                        }
+                    )
+        return attrs

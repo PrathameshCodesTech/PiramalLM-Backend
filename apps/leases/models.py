@@ -311,7 +311,9 @@ class Agreement(TenantModel):
 
     class Status(models.TextChoices):
         DRAFT = "DRAFT", "Draft"
-        PENDING = "PENDING", "Pending Approval"
+        AWAITING_WORKFLOW = "AWAITING_WORKFLOW", "Awaiting Workflow"
+        PENDING_APPROVAL = "PENDING_APPROVAL", "Pending Approval"
+        READY_TO_ACTIVATE = "READY_TO_ACTIVATE", "Ready to Activate"
         ACTIVE = "ACTIVE", "Active"
         EXPIRED = "EXPIRED", "Expired"
         TERMINATED = "TERMINATED", "Terminated"
@@ -372,13 +374,14 @@ class Agreement(TenantModel):
         blank=True,
         related_name="agreements",
     )
-    clause_mapping_draft = models.JSONField(
-        default=list,
+
+    # Approval workflow (assigned manually after submit)
+    approval_rule = models.ForeignKey(
+        "approvals.ApprovalRule",
+        on_delete=models.SET_NULL,
+        null=True,
         blank=True,
-        help_text=(
-            "Draft clause-to-section mapping for this agreement. "
-            "Used to auto-sync ClauseUsage records when the agreement is submitted."
-        ),
+        related_name="agreements",
     )
 
     class Meta:
@@ -746,27 +749,12 @@ class LeaseEscalation(TenantModel):
         return f"Escalation - {self.agreement.lease_id}"
 
     def get_effective_escalation_type(self):
-        """Get escalation type from template if use_template_values is True."""
-        if self.use_template_values and self.template:
-            return self.template.escalation_type
         return self.escalation_type
 
     def get_effective_escalation_value(self):
-        """Get escalation value from template if use_template_values is True."""
-        if self.use_template_values and self.template:
-            return self.template.escalation_percentage
         return self.escalation_value
 
     def get_effective_frequency_months(self):
-        """Get frequency from template if use_template_values is True."""
-        if self.use_template_values and self.template:
-            freq_map = {
-                'ANNUAL': 12,
-                'EVERY_2_YEARS': 24,
-                'EVERY_3_YEARS': 36,
-                'EVERY_5_YEARS': 60,
-            }
-            return freq_map.get(self.template.frequency, 12)
         return self.escalation_frequency_months
 
 
@@ -877,20 +865,6 @@ class LeaseBilling(TenantModel):
         choices=InvoiceRule.choices,
         default=InvoiceRule.FIRST_DAY
     )
-    grace_days = models.PositiveIntegerField(default=7)
-    late_fee_flat = models.DecimalField(
-        max_digits=10, decimal_places=2,
-        null=True, blank=True
-    )
-    late_fee_percent = models.DecimalField(
-        max_digits=5, decimal_places=2,
-        null=True, blank=True
-    )
-    interest_annual_percent = models.DecimalField(
-        max_digits=5, decimal_places=2,
-        null=True, blank=True
-    )
-
     # Tax
     gst_applicable = models.BooleanField(default=True)
     gst_rate = models.DecimalField(
@@ -1051,20 +1025,6 @@ class LeaseTermination(TenantModel):
     termination_clause = models.TextField(
         blank=True,
         help_text="Full termination clause text"
-    )
-
-    # =========================================================================
-    # LEGACY FIELDS (kept for backward compatibility)
-    # =========================================================================
-    governing_law = models.CharField(
-        max_length=100,
-        default="India",
-        help_text="Deprecated: Use LeaseDisputeResolution instead"
-    )
-    jurisdiction = models.CharField(
-        max_length=100,
-        blank=True,
-        help_text="Deprecated: Use LeaseDisputeResolution instead"
     )
 
     class Meta:
@@ -1262,7 +1222,9 @@ class UnitAllocation(TenantModel):
     def _blocking_statuses(cls):
         return [
             Agreement.Status.DRAFT,
-            Agreement.Status.PENDING,
+            Agreement.Status.AWAITING_WORKFLOW,
+            Agreement.Status.PENDING_APPROVAL,
+            Agreement.Status.READY_TO_ACTIVATE,
             Agreement.Status.ACTIVE,
         ]
 

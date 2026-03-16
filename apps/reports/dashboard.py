@@ -1178,7 +1178,15 @@ class DashboardService:
         draft_leases = self._apply_scope_filter(
             Agreement.objects.filter(
                 is_active=True,
-                status__in=[Agreement.Status.DRAFT, Agreement.Status.PENDING],
+                # Pre-active agreements that still require user action somewhere
+                # in the workflow (drafting, workflow assignment, approvals, or
+                # final activation) should all count as pending lease work.
+                status__in=[
+                    Agreement.Status.DRAFT,
+                    Agreement.Status.AWAITING_WORKFLOW,
+                    Agreement.Status.PENDING_APPROVAL,
+                    Agreement.Status.READY_TO_ACTIVATE,
+                ],
             )
         )
         if self.site_ids:

@@ -211,7 +211,6 @@ def me(request):
             "first_name": user.first_name,
             "last_name": user.last_name,
             "is_superuser": user.is_superuser,
-            "role": profile.role if profile else None,
         },
         "active_scope": {
             "id": active_scope.id,
@@ -571,40 +570,6 @@ class TenantScopeViewSet(ModelViewSet):
 
         return qs
 
-# ===================== Permission ViewSet =====================
-
-class PermissionViewSet(ModelViewSet):
-    queryset = models.Permission.objects.all()
-    serializer_class = serializers.PermissionSerializer
-    permission_classes = [IsAuthenticated]
-
-
-class RolePermissionViewSet(ModelViewSet):
-    queryset = models.RolePermission.objects.all()
-    serializer_class = serializers.RolePermissionSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        qs = super().get_queryset().select_related("role", "permission")
-
-        role_id = self.request.query_params.get("role_id")
-        if role_id:
-            qs = qs.filter(role_id=role_id)
-
-        scope = get_active_scope(self.request)
-        if scope:
-            qs = qs.filter(role__scope=scope)
-
-        return qs
-
-    def perform_create(self, serializer):
-        scope = get_active_scope(self.request)
-        role = serializer.validated_data.get("role")
-        if scope and role.scope_id != scope.id:
-            raise ValidationError("Role must belong to active scope.")
-        serializer.save()
-
-
 # ===================== ScopeMembership ViewSet =====================
 
 class ScopeMembershipViewSet(ScopedViewSet):
@@ -724,11 +689,6 @@ class UserViewSet(ModelViewSet):
         if department:
             qs = qs.filter(profile__department__iexact=department)
 
-        # Filter by profile role (ADMIN/MANAGER/BROKER/TENANT/VIEWER)
-        profile_role = self.request.query_params.get("role")
-        if profile_role:
-            qs = qs.filter(profile__role__iexact=profile_role)
-
         return qs
 
     @action(detail=False, methods=["post"], url_path="bulk-action")
@@ -801,7 +761,6 @@ class UserViewSet(ModelViewSet):
 
         # Extract fields
         password = data.pop("password", None) or generate_password()
-        role = data.pop("role", models.UserProfile.UserRole.MANAGER)
         profile_json = data.pop("profile_json", {})
         scope_id = data.pop("scope_id", None)
         role_id = data.pop("role_id", None)
@@ -814,7 +773,6 @@ class UserViewSet(ModelViewSet):
         # Create profile
         profile = models.UserProfile.objects.create(
             user=user,
-            role=role,
             profile_json=profile_json
         )
 
@@ -839,18 +797,6 @@ class UserViewSet(ModelViewSet):
                 scope=scope,
                 role=role_obj
             )
-            # Sync UserProfile.role from ScopeMembership role (admin/manager/staff/viewer)
-            role_code_to_profile = {
-                "admin": models.UserProfile.UserRole.ADMIN,
-                "manager": models.UserProfile.UserRole.MANAGER,
-                "staff": models.UserProfile.UserRole.MANAGER,  # no STAFF in UserRole, use MANAGER
-                "viewer": models.UserProfile.UserRole.VIEWER,
-            }
-            profile.role = role_code_to_profile.get(
-                role_obj.code.lower(),
-                models.UserProfile.UserRole.MANAGER
-            )
-            profile.save(update_fields=["role"])
 
         out = serializers.UserDetailSerializer(user).data
         out["password_plain"] = password
@@ -911,6 +857,10 @@ class UserViewSet(ModelViewSet):
             try:
                 scope = models.TenantScope.objects.get(id=scope_id)
                 role_obj = models.Role.objects.get(id=role_id)
+                if role_obj.scope_id != scope.id:
+                    raise ValidationError({"role": "Role does not belong to the selected scope."})
+                if role_obj.status != models.Role.RoleStatus.PUBLISHED:
+                    raise ValidationError({"role": "Only published roles can be assigned."})
                 membership = models.ScopeMembership.objects.create(
                     user=user, scope=scope, role=role_obj, created_by=request.user
                 )
@@ -1015,14 +965,14 @@ class RoleViewSet(ScopedViewSet):
                     models.Role.objects
                     .filter(scope_id=int(scope_id))
                     .select_related("scope", "base_on")
-                    .prefetch_related("module_permissions", "role_permissions__permission")
+                    .prefetch_related("module_permissions")
                     .order_by("code")
                 )
             except ValueError:
                 pass
 
         qs = super().get_queryset().select_related("scope", "base_on").prefetch_related(
-            "module_permissions", "role_permissions__permission"
+            "module_permissions"
         )
         role_type = self.request.query_params.get("role_type")
         if role_type:
@@ -1057,8 +1007,6 @@ class RoleViewSet(ScopedViewSet):
             can_approve_amendments=original.can_approve_amendments,
             can_approve_waivers=original.can_approve_waivers,
             can_modify_matrices=original.can_modify_matrices,
-            data_scope_type=original.data_scope_type,
-            data_scope_property_ids=original.data_scope_property_ids,
             created_by=request.user,
         )
         for mp in original.module_permissions.all():

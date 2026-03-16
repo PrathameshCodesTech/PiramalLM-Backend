@@ -1,13 +1,11 @@
 """
-Signals to auto-create TenantScope when Org/Company/Entity is created,
-and to auto-seed default roles when a TenantScope is created.
+Signals to auto-create TenantScope when Org/Company/Entity is created.
 """
 
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
 from apps.accounts.models import Company, Entity, Org, TenantScope
-from apps.accounts.role_utils import seed_roles_for_scope
 
 
 @receiver(post_save, sender=Org)
@@ -51,9 +49,3 @@ def create_entity_scope(sender, instance, created, **kwargs):
             }
         )
 
-
-@receiver(post_save, sender=TenantScope)
-def seed_roles_for_new_scope(sender, instance, created, **kwargs):
-    """Auto-seed default roles (admin, manager, staff, viewer) when TenantScope is created."""
-    if created:
-        seed_roles_for_scope(instance)

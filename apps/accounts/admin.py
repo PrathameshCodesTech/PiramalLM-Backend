@@ -46,12 +46,6 @@ class TenantScopeAdmin(admin.ModelAdmin):
         return obj.roles.count()
 
 
-@admin.register(models.Permission)
-class PermissionAdmin(admin.ModelAdmin):
-    list_display = ("id", "code", "name")
-    search_fields = ("code", "name")
-
-
 @admin.register(models.Role)
 class RoleAdmin(admin.ModelAdmin):
     list_display = ("id", "scope_type", "scope_name", "code", "name", "is_system", "is_active")
@@ -65,29 +59,6 @@ class RoleAdmin(admin.ModelAdmin):
     @admin.display(description="Scope Name")
     def scope_name(self, obj):
         return obj.scope.name if obj.scope else "-"
-
-
-@admin.register(models.RolePermission)
-class RolePermissionAdmin(admin.ModelAdmin):
-    list_display = ("id", "scope_type", "scope_name", "role_code", "permission_code")
-    list_filter = ("role__scope__scope_type", "role__scope", "role", "permission")
-    search_fields = ("role__code", "role__scope__name", "permission__code")
-
-    @admin.display(description="Scope Type")
-    def scope_type(self, obj):
-        return obj.role.scope.scope_type if obj.role and obj.role.scope else "-"
-
-    @admin.display(description="Scope Name")
-    def scope_name(self, obj):
-        return obj.role.scope.name if obj.role and obj.role.scope else "-"
-
-    @admin.display(description="Role")
-    def role_code(self, obj):
-        return obj.role.code if obj.role else "-"
-
-    @admin.display(description="Permission")
-    def permission_code(self, obj):
-        return obj.permission.code if obj.permission else "-"
 
 
 @admin.register(models.ScopeMembership)
@@ -115,7 +86,6 @@ class ScopeMembershipAdmin(admin.ModelAdmin):
 
 @admin.register(models.UserProfile)
 class UserProfileAdmin(admin.ModelAdmin):
-    list_display = ("id", "user", "role", "phone")
+    list_display = ("id", "user", "phone")
     search_fields = ("user__username", "user__email")
-    list_filter = ("role",)
 

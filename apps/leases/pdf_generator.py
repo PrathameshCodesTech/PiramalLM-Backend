@@ -407,7 +407,7 @@ def _get_sections_with_clauses(agreement):
 
 
 def _get_single_section_data(agreement, section_id):
-    """Get data for a single section."""
+    """Get data for a single section and its full subtree."""
     from apps.leases.models import AgreementSection
     from apps.clauses.models import ClauseUsage
 
@@ -416,55 +416,43 @@ def _get_single_section_data(agreement, section_id):
     except AgreementSection.DoesNotExist:
         return None
 
-    clause_usages = ClauseUsage.objects.filter(
-        agreement=agreement, section=section, is_active=True
-    ).select_related("clause", "clause_version")
+    # Reject sections that don't belong to the agreement's assigned structure
+    if agreement.structure_id and section.structure_id != agreement.structure_id:
+        return None
 
-    clauses = []
+    # Pre-load all clause usages for the agreement in one query to avoid N+1
+    clause_usages = ClauseUsage.objects.filter(
+        agreement=agreement, is_active=True
+    ).select_related("clause", "clause_version", "section").order_by("sort_order", "id")
+
+    usage_by_section = {}
     for cu in clause_usages:
+        sid = cu.section_id
+        if sid not in usage_by_section:
+            usage_by_section[sid] = []
         body = cu.custom_body_text or ""
         if not body and cu.clause_version:
             body = cu.clause_version.body_text or ""
-        clauses.append({
+        usage_by_section[sid].append({
             "clause_title": cu.clause.title,
             "clause_id": cu.clause.clause_id,
             "version": cu.clause_version.version_label if cu.clause_version else "",
             "body_text": body,
         })
 
-    children_qs = section.children.filter(is_active=True).order_by("sort_order", "name")
-    child_sections = []
-    for child in children_qs:
-        child_clauses = ClauseUsage.objects.filter(
-            agreement=agreement, section=child, is_active=True
-        ).select_related("clause", "clause_version")
-        child_clause_list = []
-        for cu in child_clauses:
-            body = cu.custom_body_text or ""
-            if not body and cu.clause_version:
-                body = cu.clause_version.body_text or ""
-            child_clause_list.append({
-                "clause_title": cu.clause.title,
-                "clause_id": cu.clause.clause_id,
-                "version": cu.clause_version.version_label if cu.clause_version else "",
-                "body_text": body,
-            })
-        child_sections.append({
-            "id": child.id,
-            "name": child.name,
-            "description": child.description,
-            "clauses": child_clause_list,
-            "children": [],
-        })
+    def _build_subtree(sec):
+        children_qs = sec.children.filter(is_active=True).order_by("sort_order", "name")
+        return {
+            "id": sec.id,
+            "name": sec.name,
+            "description": sec.description,
+            "clauses": usage_by_section.get(sec.id, []),
+            "children": [_build_subtree(child) for child in children_qs],
+        }
 
-    return {
-        "id": section.id,
-        "name": section.name,
-        "description": section.description,
-        "clauses": clauses,
-        "children": child_sections,
-        "structure_name": section.structure.name,
-    }
+    result = _build_subtree(section)
+    result["structure_name"] = section.structure.name
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -38,9 +38,9 @@ def _add_months(dt, months):
 def _get_escalated_amount(schedule):
     """
     Return the schedule amount with escalation applied if available.
-    Uses EscalationTemplate.calculate_escalated_rent() when the agreement
-    has a LeaseEscalation with use_template_values=True, otherwise falls back
-    to custom escalation_value on LeaseEscalation.
+    Reads escalation values directly from LeaseEscalation (the agreement's
+    own saved record). Template is a reference only; its values were copied
+    into LeaseEscalation at selection time.
     """
     base_amount = schedule.amount
 
@@ -60,17 +60,10 @@ def _get_escalated_amount(schedule):
         return base_amount
 
     today = date.today()
-    years_elapsed = (today - start_date).days / 365.25
 
-    if escalation.use_template_values and escalation.template_id:
-        try:
-            return escalation.template.calculate_escalated_rent(base_amount, years_elapsed)
-        except Exception:
-            pass
-
-    esc_type = escalation.get_effective_escalation_type()
-    esc_value = escalation.get_effective_escalation_value()
-    freq_months = escalation.get_effective_frequency_months()
+    esc_type = escalation.escalation_type
+    esc_value = escalation.escalation_value
+    freq_months = escalation.escalation_frequency_months
 
     if esc_type == "FIXED_PERCENT" and esc_value:
         months_elapsed = (today - start_date).days / 30.4375

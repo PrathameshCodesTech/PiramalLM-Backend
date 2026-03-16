@@ -105,14 +105,7 @@ class TenantScopeListSerializer(serializers.ModelSerializer):
         fields = ("id", "scope_type", "name", "code")
 
 
-# ===================== Permission / Role Serializers =====================
-
-class PermissionSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = models.Permission
-        fields = "__all__"
-        read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at")
-
+# ===================== Role Serializers =====================
 
 class ModulePermissionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -125,7 +118,6 @@ class ModulePermissionSerializer(serializers.ModelSerializer):
 
 class RoleSerializer(serializers.ModelSerializer):
     scope_name = serializers.CharField(source="scope.name", read_only=True)
-    permissions_list = serializers.SerializerMethodField()
     module_permissions = ModulePermissionSerializer(many=True, read_only=True)
     base_on_name = serializers.CharField(source="base_on.name", read_only=True, default=None)
 
@@ -138,18 +130,13 @@ class RoleSerializer(serializers.ModelSerializer):
             # Approval caps
             "approval_cap_amount", "can_approve_amendments",
             "can_approve_waivers", "can_modify_matrices",
-            # Data scope
-            "data_scope_type", "data_scope_property_ids",
             # Relations
-            "permissions_list", "module_permissions",
+            "module_permissions",
             # Audit
             "created_at", "updated_at", "created_by", "updated_by",
             "is_active", "deleted_at",
         )
         read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at")
-
-    def get_permissions_list(self, obj):
-        return list(obj.permissions.values_list("code", flat=True))
 
 
 class RoleWriteSerializer(serializers.ModelSerializer):
@@ -163,7 +150,6 @@ class RoleWriteSerializer(serializers.ModelSerializer):
             "is_system", "base_on",
             "approval_cap_amount", "can_approve_amendments",
             "can_approve_waivers", "can_modify_matrices",
-            "data_scope_type", "data_scope_property_ids",
             "module_permissions",
         )
 
@@ -203,16 +189,6 @@ class RoleListSerializer(serializers.ModelSerializer):
         fields = ("id", "name", "code", "is_system", "role_type", "status", "scope_name", "scope_type")
 
 
-class RolePermissionSerializer(serializers.ModelSerializer):
-    permission_code = serializers.CharField(source="permission.code", read_only=True)
-    permission_name = serializers.CharField(source="permission.name", read_only=True)
-
-    class Meta:
-        model = models.RolePermission
-        fields = "__all__"
-        read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at")
-
-
 # ===================== ScopeMembership Serializers =====================
 
 class ScopeMembershipSerializer(serializers.ModelSerializer):
@@ -226,6 +202,16 @@ class ScopeMembershipSerializer(serializers.ModelSerializer):
         model = models.ScopeMembership
         fields = "__all__"
         read_only_fields = ("id", "created_at", "updated_at", "created_by", "updated_by", "is_active", "deleted_at")
+
+    def validate(self, attrs):
+        role = attrs.get("role") or (self.instance.role if self.instance else None)
+        scope = attrs.get("scope") or (self.instance.scope if self.instance else None)
+        if role and scope:
+            if role.scope_id != scope.id:
+                raise serializers.ValidationError({"role": "Role does not belong to the selected scope."})
+            if role.status != models.Role.RoleStatus.PUBLISHED:
+                raise serializers.ValidationError({"role": "Only published roles can be assigned."})
+        return attrs
 
 
 # ===================== UserChangeLog Serializer =====================
@@ -250,7 +236,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.UserProfile
         fields = (
-            "id", "user", "role", "status", "department",
+            "id", "user", "status", "department",
             "phone", "avatar", "profile_json",
             "invite_token", "invite_accepted",
             "created_at", "updated_at", "is_active",
@@ -262,21 +248,15 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
 class UserSerializer(serializers.ModelSerializer):
     """Basic user serializer."""
-    role = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ("id", "username", "email", "first_name", "last_name", "is_active", "is_staff", "is_superuser", "role")
+        fields = ("id", "username", "email", "first_name", "last_name", "is_active", "is_staff", "is_superuser")
         read_only_fields = ("id", "is_active", "is_staff", "is_superuser")
-
-    def get_role(self, obj):
-        profile = getattr(obj, "profile", None)
-        return profile.role if profile else None
 
 
 class UserListSerializer(serializers.ModelSerializer):
     """User list with memberships count and scope info."""
-    role = serializers.SerializerMethodField()
     department = serializers.SerializerMethodField()
     user_status = serializers.SerializerMethodField()
     memberships_count = serializers.SerializerMethodField()
@@ -288,13 +268,9 @@ class UserListSerializer(serializers.ModelSerializer):
         model = User
         fields = (
             "id", "username", "email", "first_name", "last_name",
-            "is_active", "role", "department", "user_status",
+            "is_active", "department", "user_status",
             "memberships_count", "full_name", "memberships", "last_active",
         )
-
-    def get_role(self, obj):
-        profile = getattr(obj, "profile", None)
-        return profile.role if profile else None
 
     def get_department(self, obj):
         profile = getattr(obj, "profile", None)
@@ -327,7 +303,6 @@ class UserListSerializer(serializers.ModelSerializer):
 
 class UserDetailSerializer(serializers.ModelSerializer):
     """Full user detail with profile, memberships, and recent change log."""
-    role = serializers.SerializerMethodField()
     profile = serializers.SerializerMethodField()
     memberships = serializers.SerializerMethodField()
     recent_changes = serializers.SerializerMethodField()
@@ -337,19 +312,14 @@ class UserDetailSerializer(serializers.ModelSerializer):
         fields = (
             "id", "username", "email", "first_name", "last_name",
             "is_active", "is_staff", "is_superuser", "date_joined", "last_login",
-            "role", "profile", "memberships", "recent_changes",
+            "profile", "memberships", "recent_changes",
         )
-
-    def get_role(self, obj):
-        profile = getattr(obj, "profile", None)
-        return profile.role if profile else None
 
     def get_profile(self, obj):
         profile = getattr(obj, "profile", None)
         if profile:
             return {
                 "id": profile.id,
-                "role": profile.role,
                 "status": profile.status,
                 "department": profile.department,
                 "phone": profile.phone,
@@ -381,10 +351,6 @@ class UserDetailSerializer(serializers.ModelSerializer):
 class UserCreateSerializer(serializers.ModelSerializer):
     """For creating users with optional ScopeMembership (Org/Company/Entity admin)."""
     password = serializers.CharField(write_only=True, min_length=6, required=False, allow_blank=True)
-    role = serializers.ChoiceField(
-        choices=models.UserProfile.UserRole.choices,
-        default=models.UserProfile.UserRole.MANAGER
-    )
     profile_json = serializers.JSONField(required=False, default=dict)
 
     scope_id = serializers.IntegerField(write_only=True, required=False)
@@ -394,7 +360,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
         model = User
         fields = (
             "id", "username", "email", "first_name", "last_name", "password",
-            "role", "profile_json",
+            "profile_json",
             "scope_id", "role_id",
         )
         read_only_fields = ("id",)

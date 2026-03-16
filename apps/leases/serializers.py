@@ -7,6 +7,74 @@ from apps.tenants.serializers import TenantCompanyListSerializer, TenantContactS
 from . import models
 
 
+def _get_scope_ancestor_ids(scope):
+    """
+    Return the IDs of the given scope and all its ancestor scopes.
+    Mirrors InheritableScopedViewSet.get_ancestor_scope_ids from apps.core.viewsets.
+    Used by AgreementCreateSerializer.validate_structure to verify scope accessibility.
+    """
+    from apps.accounts.models import TenantScope
+    scope_ids = [scope.id]
+    if scope.scope_type == TenantScope.ScopeType.SITE and scope.site:
+        entity = scope.site.entity
+        if entity:
+            entity_scope = TenantScope.objects.filter(entity=entity, is_active=True).first()
+            if entity_scope:
+                scope_ids.append(entity_scope.id)
+            company = entity.company
+            if company:
+                company_scope = TenantScope.objects.filter(company=company, is_active=True).first()
+                if company_scope:
+                    scope_ids.append(company_scope.id)
+                org = company.org
+                if org:
+                    org_scope = TenantScope.objects.filter(org=org, is_active=True).first()
+                    if org_scope:
+                        scope_ids.append(org_scope.id)
+    elif scope.scope_type == TenantScope.ScopeType.ENTITY and scope.entity:
+        company = scope.entity.company
+        if company:
+            company_scope = TenantScope.objects.filter(company=company, is_active=True).first()
+            if company_scope:
+                scope_ids.append(company_scope.id)
+            org = company.org
+            if org:
+                org_scope = TenantScope.objects.filter(org=org, is_active=True).first()
+                if org_scope:
+                    scope_ids.append(org_scope.id)
+    elif scope.scope_type == TenantScope.ScopeType.COMPANY and scope.company:
+        org = scope.company.org
+        if org:
+            org_scope = TenantScope.objects.filter(org=org, is_active=True).first()
+            if org_scope:
+                scope_ids.append(org_scope.id)
+    return scope_ids
+
+
+def _validate_structure_scope(value, request):
+    """
+    Verify that an AgreementStructure is accessible from the scope in X-Scope-ID.
+    Returns value unchanged if valid; raises ValidationError if not.
+    Shared by AgreementSerializer and AgreementCreateSerializer.
+    """
+    if value is None or request is None:
+        return value
+    from apps.accounts.models import TenantScope
+    scope_id = request.headers.get("X-Scope-ID")
+    if not scope_id:
+        return value
+    try:
+        scope = TenantScope.objects.get(id=scope_id)
+    except TenantScope.DoesNotExist:
+        return value
+    ancestor_ids = _get_scope_ancestor_ids(scope)
+    if value.scope_id not in ancestor_ids:
+        raise serializers.ValidationError(
+            "The selected structure is not accessible from the agreement's scope."
+        )
+    return value
+
+
 # ===================== Escalation Template Serializers =====================
 
 class EscalationTemplateSerializer(serializers.ModelSerializer):
@@ -140,6 +208,24 @@ class AgreementSectionSerializer(serializers.ModelSerializer):
             "id", "scope", "created_at", "updated_at",
             "created_by", "updated_by", "is_active", "deleted_at"
         )
+
+    def validate(self, attrs):
+        structure = attrs.get("structure", getattr(self.instance, "structure", None))
+        # Resolve parent: use payload value if present; otherwise fall back to
+        # the instance's existing parent so that a structure-only PATCH still
+        # catches an orphaned cross-structure parent.
+        if "parent" in attrs:
+            parent = attrs["parent"]
+        elif self.instance is not None:
+            parent = self.instance.parent
+        else:
+            parent = None
+        if parent is not None and structure is not None:
+            if parent.structure_id != structure.id:
+                raise serializers.ValidationError({
+                    "parent": "Parent section must belong to the same structure."
+                })
+        return attrs
 
 
 class AgreementSectionListSerializer(serializers.ModelSerializer):
@@ -289,8 +375,8 @@ class LeaseEscalationSerializer(serializers.ModelSerializer):
         models.EscalationTemplate.Frequency.EVERY_5_YEARS: 60,
     }
 
-    def _apply_template_values(self, attrs, template):
-        attrs["use_template_values"] = True
+    def _copy_template_values(self, attrs, template):
+        """Copy template fields into LeaseEscalation once at selection time."""
         attrs["escalation_type"] = self.TEMPLATE_TYPE_TO_LEASE_TYPE.get(
             template.escalation_type,
             models.LeaseEscalation.EscalationType.FIXED_PERCENT,
@@ -313,24 +399,20 @@ class LeaseEscalationSerializer(serializers.ModelSerializer):
             attrs["step_schedule"] = template.step_schedule
 
     def validate(self, attrs):
-        template = attrs.get("template")
-        use_template_values = attrs.get("use_template_values")
-
-        if template is None and self.instance is not None:
-            template = self.instance.template
-        if use_template_values is None and self.instance is not None:
-            use_template_values = self.instance.use_template_values
-
-        # If a template is selected in payload, prefer template-driven values.
-        if attrs.get("template") is not None:
-            self._apply_template_values(attrs, attrs["template"])
+        # Only copy template values when a new or different template is being selected.
+        # After that, the agreement's own LeaseEscalation fields are the source of truth.
+        if "template" not in attrs:
             return attrs
 
-        if use_template_values and template is None:
-            raise serializers.ValidationError({"template": "Template is required when using template values."})
+        incoming_template = attrs["template"]
+        if incoming_template is None:
+            # Template being cleared — just save as-is, no copy needed.
+            return attrs
 
-        if use_template_values and template is not None:
-            self._apply_template_values(attrs, template)
+        current_template = self.instance.template if self.instance else None
+        if incoming_template != current_template:
+            # New template selected → seed agreement fields from template once.
+            self._copy_template_values(attrs, incoming_template)
 
         return attrs
 
@@ -857,6 +939,9 @@ class AgreementSerializer(serializers.ModelSerializer):
             "created_by", "updated_by", "is_active", "deleted_at"
         )
 
+    def validate_structure(self, value):
+        return _validate_structure_scope(value, self.context.get("request"))
+
 
 class AgreementDetailSerializer(serializers.ModelSerializer):
     """Full detail serializer with nested terms."""
@@ -894,6 +979,11 @@ class AgreementDetailSerializer(serializers.ModelSerializer):
     amendments = serializers.SerializerMethodField()
     linked_documents = serializers.SerializerMethodField()
     approval_steps = AgreementApprovalSerializer(many=True, read_only=True)
+
+    # Approval workflow info
+    approval_rule_name = serializers.CharField(
+        source="approval_rule.name", read_only=True, default=None
+    )
 
     # Computed fields
     total_allocated_area = serializers.SerializerMethodField()
@@ -1156,10 +1246,33 @@ class LeaseTermsBundleSerializer(serializers.Serializer):
 
 class AgreementCreateSerializer(serializers.ModelSerializer):
     """
-    Serializer for creating a new agreement with optional initial terms.
+    Serializer for creating a new agreement with optional initial terms,
+    optional rule template attachment, and optional AR policy creation.
+
+    Write-only extras accepted at create time:
+      selected_billing_rule_id  — copy a scope-template BillingRule onto the agreement
+      selected_dispute_rule_id  — copy a scope-template DisputeRule onto the agreement
+      selected_credit_rule_id   — copy a scope-template CreditRule onto the agreement
+      ar_rules                  — dict of ARRule field values to create at agreement level.
+                                   If omitted, ARRule is seeded from ARGlobalSettings
+                                   (or model defaults if no ARGlobalSettings exists).
     """
 
+    from apps.billing.serializers import (
+        ARRuleInputSerializer as _ARRuleInputSerializer,
+        BillingRuleAttachOverrideSerializer as _BillingRuleAttachOverrideSerializer,
+        DisputeRuleAttachOverrideSerializer as _DisputeRuleAttachOverrideSerializer,
+        CreditRuleAttachOverrideSerializer as _CreditRuleAttachOverrideSerializer,
+    )
+
     terms = LeaseTermsBundleSerializer(required=False, write_only=True)
+    selected_billing_rule_id = serializers.IntegerField(required=False, write_only=True, allow_null=True)
+    selected_dispute_rule_id = serializers.IntegerField(required=False, write_only=True, allow_null=True)
+    selected_credit_rule_id = serializers.IntegerField(required=False, write_only=True, allow_null=True)
+    billing_rule_override = _BillingRuleAttachOverrideSerializer(required=False, write_only=True, allow_null=True)
+    dispute_rule_override = _DisputeRuleAttachOverrideSerializer(required=False, write_only=True, allow_null=True)
+    credit_rule_override = _CreditRuleAttachOverrideSerializer(required=False, write_only=True, allow_null=True)
+    ar_rules = _ARRuleInputSerializer(required=False, write_only=True, allow_null=True)
 
     class Meta:
         model = models.Agreement
@@ -1169,9 +1282,21 @@ class AgreementCreateSerializer(serializers.ModelSerializer):
             "created_by", "updated_by", "is_active", "deleted_at"
         )
 
+    def validate_structure(self, value):
+        return _validate_structure_scope(value, self.context.get("request"))
+
     def create(self, validated_data):
         terms_data = validated_data.pop("terms", None)
+        billing_rule_id = validated_data.pop("selected_billing_rule_id", None)
+        dispute_rule_id = validated_data.pop("selected_dispute_rule_id", None)
+        credit_rule_id = validated_data.pop("selected_credit_rule_id", None)
+        billing_override = validated_data.pop("billing_rule_override", None) or {}
+        dispute_override = validated_data.pop("dispute_rule_override", None) or {}
+        credit_override = validated_data.pop("credit_rule_override", None) or {}
+        ar_rules_data = validated_data.pop("ar_rules", None)  # None = seed from ARGlobalSettings
+
         agreement = super().create(validated_data)
+        user = self.context["request"].user
 
         if terms_data:
             terms_serializer = LeaseTermsBundleSerializer(data=terms_data)
@@ -1179,7 +1304,107 @@ class AgreementCreateSerializer(serializers.ModelSerializer):
             terms_serializer.save(
                 agreement=agreement,
                 scope=agreement.scope,
-                user=self.context["request"].user
+                user=user,
             )
+
+        # Attach selected rule templates as agreement-level copies (with optional overrides)
+        from apps.billing.models import BillingRule, DisputeRule, CreditRule, ARRule, ARGlobalSettings
+        from apps.billing.views import _get_agreement_scope_ids
+        allowed_scope_ids = _get_agreement_scope_ids(agreement) if (billing_rule_id or dispute_rule_id or credit_rule_id) else []
+
+        if billing_rule_id:
+            try:
+                tmpl = BillingRule.objects.get(pk=billing_rule_id, agreement__isnull=True, status=BillingRule.RuleStatus.ACTIVE)
+            except BillingRule.DoesNotExist:
+                raise serializers.ValidationError({"selected_billing_rule_id": "Billing rule template not found or not active."})
+            if tmpl.scope_id not in allowed_scope_ids:
+                raise serializers.ValidationError({"selected_billing_rule_id": "Billing rule template is not visible from this agreement's scope."})
+            billing_values = {
+                "name": tmpl.name,
+                "charge_type": tmpl.charge_type,
+                "calculation_method": tmpl.calculation_method,
+                "amount": tmpl.amount,
+                "rate": tmpl.rate,
+                "max_cap_amount": tmpl.max_cap_amount,
+                "grace_period_days": tmpl.grace_period_days,
+                "trigger_mode": tmpl.trigger_mode,
+            }
+            billing_values.update(billing_override)
+            BillingRule.objects.create(
+                scope=agreement.scope, agreement=agreement,
+                trigger_event=BillingRule.TriggerEvent.OVERDUE,
+                status=BillingRule.RuleStatus.ACTIVE,
+                owner=user, created_by=user,
+                **billing_values,
+            )
+        if dispute_rule_id:
+            try:
+                tmpl = DisputeRule.objects.get(pk=dispute_rule_id, agreement__isnull=True, status=DisputeRule.RuleStatus.ACTIVE)
+            except DisputeRule.DoesNotExist:
+                raise serializers.ValidationError({"selected_dispute_rule_id": "Dispute rule template not found or not active."})
+            if tmpl.scope_id not in allowed_scope_ids:
+                raise serializers.ValidationError({"selected_dispute_rule_id": "Dispute rule template is not visible from this agreement's scope."})
+            dispute_values = {
+                "name": tmpl.name,
+                "condition_type": tmpl.condition_type,
+                "operator": tmpl.operator,
+                "threshold_value": tmpl.threshold_value,
+                "action_description": tmpl.action_description,
+                "route_to_role": tmpl.route_to_role,
+                "trigger_mode": tmpl.trigger_mode,
+            }
+            dispute_values.update(dispute_override)
+            DisputeRule.objects.create(
+                scope=agreement.scope, agreement=agreement,
+                status=DisputeRule.RuleStatus.ACTIVE, priority=1, created_by=user,
+                **dispute_values,
+            )
+        if credit_rule_id:
+            try:
+                tmpl = CreditRule.objects.get(pk=credit_rule_id, agreement__isnull=True, status=CreditRule.RuleStatus.ACTIVE)
+            except CreditRule.DoesNotExist:
+                raise serializers.ValidationError({"selected_credit_rule_id": "Credit rule template not found or not active."})
+            if tmpl.scope_id not in allowed_scope_ids:
+                raise serializers.ValidationError({"selected_credit_rule_id": "Credit rule template is not visible from this agreement's scope."})
+            credit_values = {
+                "name": tmpl.name,
+                "trigger_type": tmpl.trigger_type,
+                "trigger_mode": tmpl.trigger_mode,
+                "variance_threshold": tmpl.variance_threshold,
+                "variance_basis": tmpl.variance_basis,
+                "max_credit_amount": tmpl.max_credit_amount,
+                "auto_approve": tmpl.auto_approve,
+            }
+            credit_values.update(credit_override)
+            CreditRule.objects.create(
+                scope=agreement.scope, agreement=agreement,
+                status=CreditRule.RuleStatus.ACTIVE, created_by=user,
+                **credit_values,
+            )
+
+        # Create agreement-level ARRule.
+        # Priority: submitted ar_rules (already DRF-validated) > seeded from
+        # ARGlobalSettings > ARRule model defaults.
+        ar_kwargs = {
+            "scope": agreement.scope,
+            "agreement": agreement,
+            "created_by": user,
+        }
+
+        if ar_rules_data:
+            # Values are already typed/validated by ARRuleInputSerializer — use directly
+            ar_kwargs.update({k: v for k, v in ar_rules_data.items() if v is not None})
+        else:
+            # Seed from scope-level ARGlobalSettings if available
+            try:
+                gs = ARGlobalSettings.objects.get(scope=agreement.scope)
+                ar_kwargs["dispute_hold"] = gs.default_dispute_hold_collection
+                ar_kwargs["stop_interest_on_dispute"] = gs.default_stop_interest_on_dispute
+                ar_kwargs["stop_reminders_on_dispute"] = gs.default_stop_reminders_on_dispute
+                ar_kwargs["credit_note_requires_approval"] = gs.credit_note_requires_approval
+            except ARGlobalSettings.DoesNotExist:
+                pass  # ARRule model defaults are sufficient
+
+        ARRule.objects.create(**ar_kwargs)
 
         return agreement

@@ -463,9 +463,19 @@ class ClauseUsageViewSet(ScopedViewSet):
     def perform_update(self, serializer):
         instance = serializer.save(updated_by=self.request.user)
         try:
-            instance.apply_to_agreement()
+            if instance.active:
+                instance.apply_to_agreement()
+            else:
+                instance._clear_derived_lease_record()
         except Exception:
             pass
+
+    def perform_destroy(self, instance):
+        try:
+            instance._clear_derived_lease_record()
+        except Exception:
+            pass
+        instance.delete()
 
     @action(detail=False, methods=["get"], url_path="by-agreement/(?P<agreement_id>[^/.]+)")
     def by_agreement(self, request, agreement_id=None):

@@ -277,25 +277,37 @@ class CreditRuleAdmin(admin.ModelAdmin):
 
 @admin.register(models.ARGlobalSettings)
 class ARGlobalSettingsAdmin(admin.ModelAdmin):
+    # ARGlobalSettings is the scope-level DEFAULT/SEED source only.
+    # Agreement-level AR policy is owned by ARRule (one per agreement).
+    # Fields here seed a new ARRule when first created; they are NOT
+    # re-evaluated at runtime once an ARRule exists for the agreement.
     list_display = (
-        "scope", "enable_dispute_management", "enable_credit_note_workflow",
-        "credit_note_requires_approval", "max_auto_credit_percent"
+        "scope", "enable_dispute_management", "credit_note_requires_approval"
     )
     list_filter = (
-        "enable_dispute_management", "enable_credit_note_workflow",
-        "credit_note_requires_approval"
+        "enable_dispute_management", "credit_note_requires_approval"
     )
     fieldsets = (
         ("Scope", {
             "fields": ("scope",)
         }),
-        ("Dispute Management", {
+        ("Dispute Feature Flag (scope-level)", {
+            "description": (
+                "enable_dispute_management is a scope permission flag. "
+                "The default_* fields below are seed values copied into "
+                "ARRule when first created — they are not re-applied at "
+                "runtime once an ARRule exists."
+            ),
             "fields": (
                 "enable_dispute_management", "default_dispute_hold_collection",
                 "default_stop_interest_on_dispute", "default_stop_reminders_on_dispute"
             )
         }),
-        ("Credit Note Workflow", {
+        ("Credit Note Defaults (seed only)", {
+            "description": (
+                "These seed ARRule.credit_note_requires_approval on first creation. "
+                "Runtime enforcement reads ARRule, not these fields."
+            ),
             "fields": (
                 "enable_credit_note_workflow", "credit_note_requires_approval",
                 "max_auto_credit_percent"

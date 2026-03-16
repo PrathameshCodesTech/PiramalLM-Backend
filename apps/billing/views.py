@@ -12,6 +12,54 @@ from apps.core.viewsets import ScopedViewSet, InheritableScopedViewSet
 from . import models, serializers
 
 
+def _get_agreement_scope_ids(agreement):
+    """
+    Return [current_scope_id, parent_scope_id, ...] walking up the hierarchy
+    from the agreement's scope. Used to validate that a rule template is
+    visible from the agreement's scope chain before attaching it.
+    """
+    from apps.accounts.models import TenantScope
+
+    scope = agreement.scope
+    scope_ids = [scope.id]
+
+    if scope.scope_type == TenantScope.ScopeType.SITE and scope.site:
+        entity = scope.site.entity
+        if entity:
+            entity_scope = TenantScope.objects.filter(entity=entity, is_active=True).first()
+            if entity_scope:
+                scope_ids.append(entity_scope.id)
+            company = entity.company
+            if company:
+                company_scope = TenantScope.objects.filter(company=company, is_active=True).first()
+                if company_scope:
+                    scope_ids.append(company_scope.id)
+                org = company.org
+                if org:
+                    org_scope = TenantScope.objects.filter(org=org, is_active=True).first()
+                    if org_scope:
+                        scope_ids.append(org_scope.id)
+    elif scope.scope_type == TenantScope.ScopeType.ENTITY and scope.entity:
+        company = scope.entity.company
+        if company:
+            company_scope = TenantScope.objects.filter(company=company, is_active=True).first()
+            if company_scope:
+                scope_ids.append(company_scope.id)
+            org = company.org
+            if org:
+                org_scope = TenantScope.objects.filter(org=org, is_active=True).first()
+                if org_scope:
+                    scope_ids.append(org_scope.id)
+    elif scope.scope_type == TenantScope.ScopeType.COMPANY and scope.company:
+        org = scope.company.org
+        if org:
+            org_scope = TenantScope.objects.filter(org=org, is_active=True).first()
+            if org_scope:
+                scope_ids.append(org_scope.id)
+
+    return scope_ids
+
+
 # =============================================================================
 # AGEING CONFIG VIEWS (Tab 4 - Ageing Logic)
 # =============================================================================
@@ -222,22 +270,12 @@ class BillingRuleViewSet(InheritableScopedViewSet):
         elif self.request.query_params.get("scope_only") == "true":
             queryset = queryset.filter(agreement__isnull=True)
 
-        # Filter by category
-        category = self.request.query_params.get("category")
-        if category:
-            queryset = queryset.filter(category=category)
-
-        # Filter by applies_to
-        applies_to = self.request.query_params.get("applies_to")
-        if applies_to:
-            queryset = queryset.filter(applies_to=applies_to)
-
         # Filter by status
         status_filter = self.request.query_params.get("status")
         if status_filter:
             queryset = queryset.filter(status=status_filter)
 
-        return queryset.select_related("owner")
+        return queryset
 
     def perform_create(self, serializer):
         scope = self.get_active_scope()
@@ -245,7 +283,7 @@ class BillingRuleViewSet(InheritableScopedViewSet):
         serializer.save(
             scope=scope,
             created_by=self.request.user,
-            owner=self.request.user
+            owner=self.request.user,
         )
 
     def perform_update(self, serializer):
@@ -280,8 +318,6 @@ class BillingRuleViewSet(InheritableScopedViewSet):
             scope=scope,
             name=f"{original.name} (Copy)",
             description=original.description,
-            category=original.category,
-            applies_to=original.applies_to,
             status=models.BillingRule.RuleStatus.DRAFT,
             trigger_mode=original.trigger_mode,
             charge_type=original.charge_type,
@@ -289,15 +325,81 @@ class BillingRuleViewSet(InheritableScopedViewSet):
             amount=original.amount,
             rate=original.rate,
             max_cap_amount=original.max_cap_amount,
-            trigger_event=original.trigger_event,
+            trigger_event=models.BillingRule.TriggerEvent.OVERDUE,
             grace_period_days=original.grace_period_days,
-            gl_code=original.gl_code,
             owner=request.user,
             created_by=request.user,
         )
 
         serializer = self.get_serializer(cloned)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="attach-to-agreement")
+    def attach_to_agreement(self, request, pk=None):
+        """Attach a scope-level billing rule template to an agreement (explicit, max 1 per agreement).
+
+        Accepts optional ``override`` dict to customise values at attach time:
+            { "agreement_id": 123, "override": { "name": "...", "rate": 5.0, ... } }
+        """
+        original = self.get_object()
+        if original.agreement_id is not None:
+            return Response(
+                {"error": "Source rule must be a scope-level template (agreement must be null)"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        agreement_id = request.data.get("agreement_id")
+        if not agreement_id:
+            return Response({"error": "agreement_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        from apps.leases.models import Agreement
+        try:
+            agreement = Agreement.objects.get(pk=agreement_id)
+        except Agreement.DoesNotExist:
+            return Response({"error": "Agreement not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if models.BillingRule.objects.filter(agreement=agreement).exists():
+            return Response(
+                {"error": "A billing rule is already attached to this agreement. Detach it first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        allowed_scope_ids = _get_agreement_scope_ids(agreement)
+        if original.scope_id not in allowed_scope_ids:
+            return Response(
+                {"error": "Template is not visible from this agreement's scope chain"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Validate optional override payload
+        override_data = request.data.get("override") or {}
+        if override_data:
+            from apps.billing.serializers import BillingRuleAttachOverrideSerializer
+            override_ser = BillingRuleAttachOverrideSerializer(data=override_data)
+            if not override_ser.is_valid():
+                return Response(override_ser.errors, status=status.HTTP_400_BAD_REQUEST)
+            override_data = override_ser.validated_data
+
+        billing_values = {
+            "name": original.name,
+            "charge_type": original.charge_type,
+            "calculation_method": original.calculation_method,
+            "amount": original.amount,
+            "rate": original.rate,
+            "max_cap_amount": original.max_cap_amount,
+            "grace_period_days": original.grace_period_days,
+            "trigger_mode": original.trigger_mode,
+        }
+        billing_values.update(override_data)
+
+        attached = models.BillingRule.objects.create(
+            scope=agreement.scope,
+            agreement=agreement,
+            trigger_event=models.BillingRule.TriggerEvent.OVERDUE,
+            status=models.BillingRule.RuleStatus.ACTIVE,
+            owner=request.user,
+            created_by=request.user,
+            **billing_values,
+        )
+        return Response(self.get_serializer(attached).data, status=status.HTTP_201_CREATED)
 
 
 # =============================================================================
@@ -386,6 +488,69 @@ class DisputeRuleViewSet(InheritableScopedViewSet):
         rule.save()
         serializer = self.get_serializer(rule)
         return Response(serializer.data)
+
+    @action(detail=True, methods=["post"], url_path="attach-to-agreement")
+    def attach_to_agreement(self, request, pk=None):
+        """Attach a scope-level dispute rule template to an agreement (explicit, max 1 per agreement).
+
+        Accepts optional ``override`` dict to customise values at attach time.
+        """
+        original = self.get_object()
+        if original.agreement_id is not None:
+            return Response(
+                {"error": "Source rule must be a scope-level template (agreement must be null)"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        agreement_id = request.data.get("agreement_id")
+        if not agreement_id:
+            return Response({"error": "agreement_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        from apps.leases.models import Agreement
+        try:
+            agreement = Agreement.objects.get(pk=agreement_id)
+        except Agreement.DoesNotExist:
+            return Response({"error": "Agreement not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if models.DisputeRule.objects.filter(agreement=agreement).exists():
+            return Response(
+                {"error": "A dispute rule is already attached to this agreement. Detach it first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        allowed_scope_ids = _get_agreement_scope_ids(agreement)
+        if original.scope_id not in allowed_scope_ids:
+            return Response(
+                {"error": "Template is not visible from this agreement's scope chain"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        override_data = request.data.get("override") or {}
+        if override_data:
+            from apps.billing.serializers import DisputeRuleAttachOverrideSerializer
+            override_ser = DisputeRuleAttachOverrideSerializer(data=override_data)
+            if not override_ser.is_valid():
+                return Response(override_ser.errors, status=status.HTTP_400_BAD_REQUEST)
+            override_data = override_ser.validated_data
+
+        dispute_values = {
+            "name": original.name,
+            "condition_type": original.condition_type,
+            "operator": original.operator,
+            "threshold_value": original.threshold_value,
+            "action_description": original.action_description,
+            "route_to_role": original.route_to_role,
+            "trigger_mode": original.trigger_mode,
+        }
+        dispute_values.update(override_data)
+
+        attached = models.DisputeRule.objects.create(
+            scope=agreement.scope,
+            agreement=agreement,
+            status=models.DisputeRule.RuleStatus.ACTIVE,
+            priority=1,
+            created_by=request.user,
+            **dispute_values,
+        )
+        return Response(self.get_serializer(attached).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["post"])
     def reorder(self, request):
@@ -485,6 +650,68 @@ class CreditRuleViewSet(InheritableScopedViewSet):
         rule.save()
         serializer = self.get_serializer(rule)
         return Response(serializer.data)
+
+    @action(detail=True, methods=["post"], url_path="attach-to-agreement")
+    def attach_to_agreement(self, request, pk=None):
+        """Attach a scope-level credit rule template to an agreement (explicit, max 1 per agreement).
+
+        Accepts optional ``override`` dict to customise values at attach time.
+        """
+        original = self.get_object()
+        if original.agreement_id is not None:
+            return Response(
+                {"error": "Source rule must be a scope-level template (agreement must be null)"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        agreement_id = request.data.get("agreement_id")
+        if not agreement_id:
+            return Response({"error": "agreement_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        from apps.leases.models import Agreement
+        try:
+            agreement = Agreement.objects.get(pk=agreement_id)
+        except Agreement.DoesNotExist:
+            return Response({"error": "Agreement not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if models.CreditRule.objects.filter(agreement=agreement).exists():
+            return Response(
+                {"error": "A credit rule is already attached to this agreement. Detach it first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        allowed_scope_ids = _get_agreement_scope_ids(agreement)
+        if original.scope_id not in allowed_scope_ids:
+            return Response(
+                {"error": "Template is not visible from this agreement's scope chain"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        override_data = request.data.get("override") or {}
+        if override_data:
+            from apps.billing.serializers import CreditRuleAttachOverrideSerializer
+            override_ser = CreditRuleAttachOverrideSerializer(data=override_data)
+            if not override_ser.is_valid():
+                return Response(override_ser.errors, status=status.HTTP_400_BAD_REQUEST)
+            override_data = override_ser.validated_data
+
+        credit_values = {
+            "name": original.name,
+            "trigger_type": original.trigger_type,
+            "trigger_mode": original.trigger_mode,
+            "variance_threshold": original.variance_threshold,
+            "variance_basis": original.variance_basis,
+            "max_credit_amount": original.max_credit_amount,
+            "auto_approve": original.auto_approve,
+        }
+        credit_values.update(override_data)
+
+        attached = models.CreditRule.objects.create(
+            scope=agreement.scope,
+            agreement=agreement,
+            status=models.CreditRule.RuleStatus.ACTIVE,
+            created_by=request.user,
+            **credit_values,
+        )
+        return Response(self.get_serializer(attached).data, status=status.HTTP_201_CREATED)
 
 
 # =============================================================================
@@ -980,24 +1207,9 @@ class InvoiceViewSet(ScopedViewSet):
         invoice.status = models.Invoice.InvoiceStatus.DISPUTED
         invoice.save()
 
-        # Apply global dispute hold defaults from ARGlobalSettings
-        if ar_settings:
-            try:
-                ar = invoice.agreement.ar_rules
-                if ar_settings.default_dispute_hold_collection:
-                    ar.dispute_hold = True
-                if ar_settings.default_stop_interest_on_dispute:
-                    ar.stop_interest_on_dispute = True
-                if ar_settings.default_stop_reminders_on_dispute:
-                    ar.stop_reminders_on_dispute = True
-                ar.save(update_fields=[
-                    "dispute_hold",
-                    "stop_interest_on_dispute",
-                    "stop_reminders_on_dispute",
-                ])
-            except Exception:
-                pass  # AR rules may not exist yet; don't block dispute
-
+        # ARRule (agreement-level) is the sole owner of dispute hold behaviour.
+        # ARGlobalSettings only seeds defaults when an ARRule is first created.
+        # Do NOT mutate the agreement's ARRule here from ARGlobalSettings.
         try:
             RulesEngine.check_dispute_rules(invoice, scope, request.user)
         except Exception:
@@ -1322,19 +1534,26 @@ class CreditNoteViewSet(ScopedViewSet):
         scope = self.get_active_scope()
         credit_note = serializer.save(scope=scope, created_by=self.request.user)
 
-        # Enforce ARGlobalSettings: if credit_note_requires_approval is True,
-        # move the CN to PENDING_APPROVAL unless a credit rule already set a
-        # definitive status (APPROVED / REJECTED / etc.).
-        try:
-            ar_settings = models.ARGlobalSettings.objects.get(scope=scope)
-            if (
-                ar_settings.credit_note_requires_approval
-                and credit_note.status == models.CreditNote.CreditNoteStatus.DRAFT
-            ):
+        # Determine whether approval is required using the precedence:
+        #   1. ARRule (agreement-level policy) — the sole agreement owner
+        #   2. ARGlobalSettings (scope-level default) — only used as fallback
+        #      when no agreement-level ARRule exists yet
+        requires_approval = False
+        if credit_note.status == models.CreditNote.CreditNoteStatus.DRAFT:
+            try:
+                ar_rule = credit_note.invoice.agreement.ar_rules
+                requires_approval = ar_rule.credit_note_requires_approval
+            except Exception:
+                # No ARRule — fall back to scope-level default
+                try:
+                    ar_settings = models.ARGlobalSettings.objects.get(scope=scope)
+                    requires_approval = ar_settings.credit_note_requires_approval
+                except models.ARGlobalSettings.DoesNotExist:
+                    pass
+
+            if requires_approval:
                 credit_note.status = models.CreditNote.CreditNoteStatus.PENDING_APPROVAL
                 credit_note.save(update_fields=["status"])
-        except models.ARGlobalSettings.DoesNotExist:
-            pass
 
         try:
             RulesEngine.check_credit_rules(credit_note, scope, self.request.user)

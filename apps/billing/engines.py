@@ -131,7 +131,8 @@ class RulesEngine:
     def check_credit_rules(credit_note, scope, user):
         """
         Called after a CreditNote is created.
-        Checks agreement-specific CreditRules first; falls back to scope-level rules.
+        Only evaluates credit rules explicitly attached to the agreement.
+        No implicit fallback to scope-level rules.
         Finds the first matching ACTIVE CreditRule and either:
           - AUTO: sets status/approval on the CN and logs an APPLIED action
           - MANUAL: creates a PENDING action for the user to review
@@ -140,27 +141,17 @@ class RulesEngine:
         if not trigger_type:
             return  # No mapping — nothing to check
 
-        # Agreement-specific rules take priority over scope-level rules
         agreement = getattr(credit_note, "agreement", None) or getattr(
             credit_note.invoice, "agreement", None
         )
-        rules = None
-        if agreement:
-            agreement_rules = models.CreditRule.objects.filter(
-                agreement=agreement,
-                status=models.CreditRule.RuleStatus.ACTIVE,
-                trigger_type=trigger_type,
-            )
-            if agreement_rules.exists():
-                rules = agreement_rules
+        if not agreement:
+            return  # No agreement attached — no rules to evaluate
 
-        if rules is None:
-            rules = models.CreditRule.objects.filter(
-                scope=scope,
-                agreement__isnull=True,
-                status=models.CreditRule.RuleStatus.ACTIVE,
-                trigger_type=trigger_type,
-            )
+        rules = models.CreditRule.objects.filter(
+            agreement=agreement,
+            status=models.CreditRule.RuleStatus.ACTIVE,
+            trigger_type=trigger_type,
+        )
 
         for rule in rules:
             if not _credit_rule_matches(rule, credit_note):
@@ -213,27 +204,19 @@ class RulesEngine:
     def check_dispute_rules(invoice, scope, user):
         """
         Called when an Invoice is disputed.
-        Checks agreement-specific DisputeRules first; falls back to scope-level rules.
+        Only evaluates dispute rules explicitly attached to the agreement.
+        No implicit fallback to scope-level rules.
         Finds the first matching ACTIVE DisputeRule (by priority) and either:
           - AUTO: applies hold/SLA immediately and logs an APPLIED action
           - MANUAL: creates a PENDING action for the user to review
         """
-        # Agreement-specific rules take priority
-        rules = None
-        if invoice.agreement_id:
-            agreement_rules = models.DisputeRule.objects.filter(
-                agreement=invoice.agreement,
-                status=models.DisputeRule.RuleStatus.ACTIVE,
-            ).order_by("priority")
-            if agreement_rules.exists():
-                rules = agreement_rules
+        if not invoice.agreement_id:
+            return  # No agreement attached — no rules to evaluate
 
-        if rules is None:
-            rules = models.DisputeRule.objects.filter(
-                scope=scope,
-                agreement__isnull=True,
-                status=models.DisputeRule.RuleStatus.ACTIVE,
-            ).order_by("priority")
+        rules = models.DisputeRule.objects.filter(
+            agreement=invoice.agreement,
+            status=models.DisputeRule.RuleStatus.ACTIVE,
+        ).order_by("priority")
 
         for rule in rules:
             if not _evaluate(rule.condition_type, rule.operator, rule.threshold_value, invoice):
@@ -293,36 +276,27 @@ class RulesEngine:
     def check_billing_rules(invoice, scope, user=None):
         """
         Called by the nightly process_overdue_invoices command for each OVERDUE invoice.
-        Checks agreement-specific BillingRules first; falls back to scope-level rules.
+        Only evaluates billing rules explicitly attached to the agreement.
+        No implicit fallback to scope-level rules.
 
         Finds all ACTIVE BillingRules with trigger_event=OVERDUE and:
           - Skips rules whose grace_period_days haven't elapsed yet
           - AUTO: creates a new LATE_FEE Invoice and logs an APPLIED action
           - MANUAL: creates a PENDING action for the user to review
 
-        Only the first matching rule fires per invoice (same pattern as credit/dispute rules).
+        Only the first matching rule fires per invoice.
         """
         today = timezone.now().date()
         overdue_days = (today - invoice.due_date).days
 
-        # Agreement-specific rules take priority over scope-level rules
-        rules = None
-        if invoice.agreement_id:
-            agreement_rules = models.BillingRule.objects.filter(
-                agreement=invoice.agreement,
-                status=models.BillingRule.RuleStatus.ACTIVE,
-                trigger_event=models.BillingRule.TriggerEvent.OVERDUE,
-            )
-            if agreement_rules.exists():
-                rules = agreement_rules
+        if not invoice.agreement_id:
+            return  # No agreement attached — no rules to evaluate
 
-        if rules is None:
-            rules = models.BillingRule.objects.filter(
-                scope=scope,
-                agreement__isnull=True,
-                status=models.BillingRule.RuleStatus.ACTIVE,
-                trigger_event=models.BillingRule.TriggerEvent.OVERDUE,
-            )
+        rules = models.BillingRule.objects.filter(
+            agreement=invoice.agreement,
+            status=models.BillingRule.RuleStatus.ACTIVE,
+            trigger_event=models.BillingRule.TriggerEvent.OVERDUE,
+        )
 
         for rule in rules:
             # Respect grace period
@@ -406,10 +380,20 @@ def _calculate_billing_charge(rule, invoice, overdue_days):
     return Decimal("0")
 
 
+_CHARGE_TYPE_TO_LINE_ITEM_TYPE = {
+    "LATE_PAYMENT_FEE":    models.InvoiceLineItem.LineItemType.LATE_FEE,
+    "INTEREST":            models.InvoiceLineItem.LineItemType.INTEREST,
+    "PENALTY":             models.InvoiceLineItem.LineItemType.OTHER,
+    "ADMINISTRATIVE_FEE":  models.InvoiceLineItem.LineItemType.ADJUSTMENT,
+    "CAM_RECONCILIATION":  models.InvoiceLineItem.LineItemType.CAM,
+    "OTHER":               models.InvoiceLineItem.LineItemType.OTHER,
+}
+
+
 def _create_late_fee_invoice(invoice, rule, charge, today):
     """
     Create a new LATE_FEE Invoice linked to the same agreement.
-    Also adds a single InvoiceLineItem for the charge.
+    Also adds a single InvoiceLineItem whose type reflects the rule's charge_type.
     """
     new_number = f"LF-{invoice.invoice_number}-{today.strftime('%Y%m%d')}"
 
@@ -444,10 +428,14 @@ def _create_late_fee_invoice(invoice, rule, charge, today):
         ),
     )
 
+    line_item_type = _CHARGE_TYPE_TO_LINE_ITEM_TYPE.get(
+        rule.charge_type,
+        models.InvoiceLineItem.LineItemType.LATE_FEE,
+    )
     models.InvoiceLineItem.objects.create(
         invoice=late_inv,
         scope=invoice.scope,
-        item_type=models.InvoiceLineItem.LineItemType.LATE_FEE,
+        item_type=line_item_type,
         description=f"{rule.get_charge_type_display()} – {rule.name}",
         quantity=Decimal("1"),
         unit_price=charge,

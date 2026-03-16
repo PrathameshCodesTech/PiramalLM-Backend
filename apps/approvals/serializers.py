@@ -30,7 +30,7 @@ class ApprovalLevelSerializer(serializers.ModelSerializer):
         model = ApprovalLevel
         fields = [
             "id", "level", "role", "role_name", "role_code",
-            "approval_required", "sla_hours", "allow_auto_skip_if_vacant",
+            "approval_required", "sla_hours",
         ]
 
     def validate_level(self, val):
@@ -44,7 +44,7 @@ class ApprovalLevelWriteSerializer(serializers.ModelSerializer):
         model = ApprovalLevel
         fields = [
             "id", "level", "role", "approval_required",
-            "sla_hours", "allow_auto_skip_if_vacant",
+            "sla_hours",
         ]
 
 
@@ -55,9 +55,6 @@ class ApprovalRuleSerializer(serializers.ModelSerializer):
     levels = ApprovalLevelSerializer(many=True, read_only=True)
     logs = ApprovalRuleLogSerializer(many=True, read_only=True)
     label = serializers.SerializerMethodField()
-    escalate_to_role_name = serializers.CharField(
-        source="escalate_to_role.name", read_only=True, default=None
-    )
     total_sla_hours = serializers.SerializerMethodField()
 
     class Meta:
@@ -70,12 +67,6 @@ class ApprovalRuleSerializer(serializers.ModelSerializer):
             "lease_term_min_months", "lease_term_max_months",
             # SLA
             "overall_sla_hours", "total_sla_hours",
-            # Escalation
-            "enable_escalations", "escalate_after_hours",
-            "escalate_to_role", "escalate_to_role_name",
-            "send_escalation_notification",
-            # Options
-            "parallel_approvals_same_level",
             # Related
             "levels", "logs",
             # Audit
@@ -105,6 +96,7 @@ class ApprovalRuleListSerializer(serializers.ModelSerializer):
             "id", "name", "status", "label",
             "lease_value_min", "lease_value_max",
             "tenant_types",
+            "lease_term_min_months", "lease_term_max_months",
             "overall_sla_hours", "total_sla_hours",
             "l1_approver", "l2_approver", "l3_approver",
             "levels",
@@ -153,9 +145,6 @@ class ApprovalRuleWriteSerializer(serializers.ModelSerializer):
             "tenant_types",
             "lease_term_min_months", "lease_term_max_months",
             "overall_sla_hours",
-            "enable_escalations", "escalate_after_hours",
-            "escalate_to_role", "send_escalation_notification",
-            "parallel_approvals_same_level",
             "levels",
         ]
 

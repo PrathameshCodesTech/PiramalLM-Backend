@@ -451,9 +451,6 @@ class BillingRule(TenantModel):
 
     class TriggerEvent(models.TextChoices):
         OVERDUE = "OVERDUE", "When Invoice is Overdue"
-        MONTHLY = "MONTHLY", "Monthly (recurring)"
-        ON_INVOICE = "ON_INVOICE", "On Invoice Generation"
-        MANUAL_ONLY = "MANUAL_ONLY", "Manual Trigger Only"
 
     rule_id = models.CharField(
         max_length=20,
@@ -609,7 +606,6 @@ class DisputeRule(TenantModel):
     class ConditionType(models.TextChoices):
         INVOICE_AMOUNT = "INVOICE_AMOUNT", "Invoice Amount"
         DISPUTE_COUNT = "DISPUTE_COUNT", "Dispute Count"
-        CUSTOMER_TYPE = "CUSTOMER_TYPE", "Customer Type"
         INVOICE_AGE = "INVOICE_AGE", "Invoice Age (Days)"
         DISPUTE_AMOUNT = "DISPUTE_AMOUNT", "Dispute Amount"
 

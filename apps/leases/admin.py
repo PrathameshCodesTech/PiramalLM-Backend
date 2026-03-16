@@ -41,7 +41,7 @@ class LeaseDepositAdmin(admin.ModelAdmin):
 
 @admin.register(models.LeaseBilling)
 class LeaseBillingAdmin(admin.ModelAdmin):
-    list_display = ("agreement", "invoice_generate_rule", "grace_days")
+    list_display = ("agreement", "invoice_generate_rule", "gst_applicable", "gst_rate")
 
 
 @admin.register(models.UnitAllocation)
@@ -119,7 +119,7 @@ class LeaseTerminationAdmin(admin.ModelAdmin):
             "fields": ("termination_for_cause_events", "cure_period_days")
         }),
         ("General", {
-            "fields": ("termination_clause", "governing_law", "jurisdiction")
+            "fields": ("termination_clause",)
         }),
     )
 

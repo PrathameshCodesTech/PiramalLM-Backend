@@ -260,13 +260,6 @@ class ScopeMembership(AuditModel):
 
 
 class UserProfile(AuditModel):
-    class UserRole(models.TextChoices):
-        ADMIN = "ADMIN", "Admin"
-        MANAGER = "MANAGER", "Manager"
-        BROKER = "BROKER", "Broker"
-        TENANT = "TENANT", "Tenant"
-        VIEWER = "VIEWER", "Viewer"
-
     class UserStatus(models.TextChoices):
         ACTIVE = "ACTIVE", "Active"
         INACTIVE = "INACTIVE", "Inactive"
@@ -274,12 +267,6 @@ class UserProfile(AuditModel):
         SUSPENDED = "SUSPENDED", "Suspended"
 
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile")
-    role = models.CharField(
-        max_length=20,
-        choices=UserRole.choices,
-        default=UserRole.VIEWER,
-        help_text="User's primary role in the system"
-    )
     status = models.CharField(
         max_length=20,
         choices=UserStatus.choices,
@@ -327,29 +314,14 @@ class UserChangeLog(models.Model):
         return f"{self.user_id}.{self.field_changed} @ {self.changed_at}"
 
 
-class Permission(AuditModel):
-    code = models.SlugField(max_length=120, unique=True)
-    name = models.CharField(max_length=200)
-    description = models.CharField(max_length=255, blank=True)
-
-    def __str__(self):
-        return self.code
-
-
 class Role(AuditModel):
     class RoleType(models.TextChoices):
         ADMIN = "ADMIN", "Admin"
         BUSINESS = "BUSINESS", "Business (Internal)"
-        TENANT = "TENANT", "Tenant"
-        READONLY = "READONLY", "Read-only"
 
     class RoleStatus(models.TextChoices):
         DRAFT = "DRAFT", "Draft"
         PUBLISHED = "PUBLISHED", "Published"
-
-    class DataScopeType(models.TextChoices):
-        ALL = "ALL", "All Properties"
-        SELECTED = "SELECTED", "Specific Properties"
 
     scope = models.ForeignKey(TenantScope, on_delete=models.CASCADE, related_name="roles")
     name = models.CharField(max_length=200)
@@ -382,18 +354,6 @@ class Role(AuditModel):
     can_approve_amendments = models.BooleanField(default=False)
     can_approve_waivers = models.BooleanField(default=False)
     can_modify_matrices = models.BooleanField(default=False)
-    # Data scope
-    data_scope_type = models.CharField(
-        max_length=20,
-        choices=DataScopeType.choices,
-        default=DataScopeType.ALL,
-    )
-    data_scope_property_ids = models.JSONField(
-        default=list,
-        blank=True,
-        help_text="List of site IDs if data_scope_type=SELECTED",
-    )
-    permissions = models.ManyToManyField(Permission, through="RolePermission", related_name="roles")
 
     class Meta:
         constraints = [
@@ -406,16 +366,6 @@ class Role(AuditModel):
     def publish(self):
         self.status = self.RoleStatus.PUBLISHED
         self.save(update_fields=["status", "updated_at"])
-
-
-class RolePermission(AuditModel):
-    role = models.ForeignKey(Role, on_delete=models.CASCADE, related_name="role_permissions")
-    permission = models.ForeignKey(Permission, on_delete=models.CASCADE, related_name="permission_roles")
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(fields=["role", "permission"], name="uq_role_permission"),
-        ]
 
 
 class ModulePermission(AuditModel):
