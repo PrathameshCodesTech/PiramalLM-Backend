@@ -24,7 +24,7 @@ from django.contrib.auth import get_user_model
 from django.core.management.base import BaseCommand
 
 from apps.accounts.models import (
-    Company, Entity, Org, Role, ScopeMembership, TenantScope,
+    Company, Entity, ModulePermission, Org, Role, ScopeMembership, TenantScope,
 )
 from apps.leases.models import Agreement, LeaseTermDates, UnitAllocation
 from apps.properties.models import Floor, Site, Tower, Unit
@@ -96,25 +96,63 @@ class Command(BaseCommand):
         scope = entity_scope
 
         # ─────────────────────────────────────────────────────────────
-        # 3. ADMIN USER
+        # 3. ROLE + USER WITH FULL ACCESS TO ENTITY SCOPE
         # ─────────────────────────────────────────────────────────────
-        self.stdout.write("\n[3/7] Admin user...")
+        self.stdout.write("\n[3/7] Role & user...")
 
-        superuser = User.objects.filter(is_superuser=True).first()
-        if superuser:
-            self.stdout.write(f"  Using existing superuser: {superuser.username}")
-        else:
-            superuser = User.objects.create_superuser(
-                username="admin",
-                password="admin123",
-                email="admin@piramallease.com",
+        # Create a full-access role at entity scope
+        admin_role, role_created = Role.objects.get_or_create(
+            scope=entity_scope,
+            code="piramal-admin",
+            defaults={"name": "Piramal Admin", "is_system": False},
+        )
+        self._log("Role", admin_role.name, role_created)
+
+        # Grant can_view=True for every module so the sidebar shows everything
+        all_modules = [m[0] for m in ModulePermission.Module.choices]
+        for module in all_modules:
+            ModulePermission.objects.get_or_create(
+                role=admin_role,
+                module=module,
+                defaults={
+                    "can_view": True,
+                    "can_create": True,
+                    "can_edit": True,
+                    "can_delete": True,
+                    "can_approve": True,
+                },
             )
-            self.stdout.write("  Created superuser: admin / admin123")
+        self.stdout.write(f"  Module permissions set for {len(all_modules)} modules")
+
+        # Create the demo login user
+        user, user_created = User.objects.get_or_create(
+            username="piramal",
+            defaults={
+                "email": "piramal@piramallease.com",
+                "first_name": "Piramal",
+                "last_name": "Admin",
+                "is_active": True,
+                "is_superuser": False,
+                "is_staff": False,
+            },
+        )
+        if user_created:
+            user.set_password("piramal123")
+            user.save()
+        self._log("User", f"piramal / piramal123", user_created)
+
+        # Link user → scope via membership
+        membership, m_created = ScopeMembership.objects.get_or_create(
+            user=user,
+            scope=entity_scope,
+            defaults={"role": admin_role, "is_active": True},
+        )
+        self._log("ScopeMembership", f"piramal → {entity_scope.name}", m_created)
 
         # ─────────────────────────────────────────────────────────────
         # 4. SITES (Properties)
         # ─────────────────────────────────────────────────────────────
-        self.stdout.write("\n[4/7] Sites...")
+        self.stdout.write("\n[4/8] Sites...")
 
         tower_site, _ = Site.objects.get_or_create(
             scope=scope,
@@ -157,7 +195,7 @@ class Command(BaseCommand):
         # ─────────────────────────────────────────────────────────────
         # 5. TOWERS / FLOORS / UNITS
         # ─────────────────────────────────────────────────────────────
-        self.stdout.write("\n[5/7] Towers / Floors / Units...")
+        self.stdout.write("\n[5/8] Towers / Floors / Units...")
 
         # Helper to create a tower + floors + units
         def make_tower_floors_units(site, tower_code, tower_name, floors_data):
@@ -225,7 +263,7 @@ class Command(BaseCommand):
         # ─────────────────────────────────────────────────────────────
         # 6. TENANT COMPANIES
         # ─────────────────────────────────────────────────────────────
-        self.stdout.write("\n[6/7] Tenant companies...")
+        self.stdout.write("\n[6/8] Tenant companies...")
 
         tenants_data = [
             ("Abc",            "abc@example.com",         "+91 98765 43210"),
@@ -255,7 +293,7 @@ class Command(BaseCommand):
         # ─────────────────────────────────────────────────────────────
         # 7. LEASE AGREEMENTS
         # ─────────────────────────────────────────────────────────────
-        self.stdout.write("\n[7/7] Lease agreements...")
+        self.stdout.write("\n[7/8] Lease agreements...")
 
         leases = [
             {
@@ -352,6 +390,10 @@ class Command(BaseCommand):
         self.stdout.write("  Tenants:  Abc, Unity Bank, Teb Ltd, Infinity B Tech,")
         self.stdout.write("            Marvel, Kotak Bank, Sun Pharma")
         self.stdout.write("  Leases:   LSE-2026-000001 … LSE-2026-000005")
+        self.stdout.write("")
+        self.stdout.write("  LOGIN CREDENTIALS:")
+        self.stdout.write("    Superuser : admin / admin123")
+        self.stdout.write("    Tenant UI : piramal / piramal123")
         self.stdout.write("=" * 60)
 
     def _log(self, kind, name, created):
